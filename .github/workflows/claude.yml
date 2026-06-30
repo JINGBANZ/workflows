@@ -1,0 +1,43 @@
+name: Claude Code (reusable)
+
+# Reusable workflow for on-demand @claude mentions. The caller owns the trigger events and the
+# @claude `if:` gate; this file only runs when called via `uses:`.
+on:
+  workflow_call:
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+
+jobs:
+  claude:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      id-token: write
+      actions: read # Required for Claude to read CI results on PRs
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+
+          # Lets Claude read CI results on PRs.
+          additional_permissions: |
+            actions: read
+
+          # Optional: give Claude a fixed prompt. If omitted, Claude follows the instructions in the
+          # comment that mentioned @claude.
+          # prompt: 'Update the pull request description to include a summary of changes.'
+
+          # Optional: pass extra CLI args (model, allowed tools, etc.).
+          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
+          # or https://code.claude.com/docs/en/cli-reference for available options.
+          # claude_args: '--allowed-tools Bash(gh pr *)'
