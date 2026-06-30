@@ -10,9 +10,6 @@ private ones) can call these via `workflow_call`.
 | `.github/workflows/claude-code-review.yml` | Automatic Claude PR review — posts inline diff comments. |
 | `.github/workflows/claude.yml` | On-demand `@claude` mentions in issues/PRs. |
 
-Each has only an `on: workflow_call` trigger, so they never run here — they run in the repo that
-calls them.
-
 ## Quick start (in a target repo)
 
 1. Open Claude Code in the target repository.
@@ -31,6 +28,3 @@ Ready-to-copy caller workflows live in [`templates/`](./templates):
 Drop one into the target repo's `.github/workflows/`. The caller owns the triggers (and the
 `@claude` gate) and passes the `CLAUDE_CODE_OAUTH_TOKEN` secret down; the review logic stays here, so
 updates roll out to every caller automatically.
-
-> The templates reference the reusable workflows at `@main`. Pin to a tag or commit SHA instead if
-> you want changes to roll out only when you bump the ref.
