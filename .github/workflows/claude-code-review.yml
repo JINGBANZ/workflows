@@ -1,0 +1,48 @@
+name: Claude Code Review (reusable)
+
+# Reusable workflow. Call it from another repo's caller workflow with `uses:`; the caller owns the
+# trigger (e.g. `on: pull_request`) and passes the CLAUDE_CODE_OAUTH_TOKEN secret. This file has only
+# a `workflow_call` trigger, so it never runs on its own in this hub repo.
+#
+# Inside a called workflow the `github` context is the CALLER's, so `github.repository` and
+# `github.event.pull_request.number` resolve to the caller's PR, and `actions/checkout` checks out the
+# caller's code (its CLAUDE.md + diff).
+on:
+  workflow_call:
+    inputs:
+      model:
+        description: Top-level driver model for the review (the code-review command still spawns Opus bug subagents internally).
+        type: string
+        required: false
+        default: claude-sonnet-4-6
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+
+jobs:
+  claude-review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code Review
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
+          plugins: 'code-review@claude-code-plugins'
+          # --comment posts the review to the PR; the inline-comment tool in --allowedTools is what
+          # makes the action start the github_inline_comment MCP server (otherwise it falls back to a
+          # single top-level comment).
+          prompt: '/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
+          claude_args: |
+            --model ${{ inputs.model }}
+            --allowedTools "mcp__github_inline_comment__create_inline_comment"
