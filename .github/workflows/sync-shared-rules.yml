@@ -1,0 +1,65 @@
+# Reusable workflow: sync the shared engineering rules from JINGBANZ/rules into the calling repo.
+#
+# Fetches shared-rules.md from the source repo and splices it between the
+# <!-- shared-rules:begin --> / <!-- shared-rules:end --> markers of the target file in the CALLING
+# repo, then opens a PR there if anything changed. Runs entirely on the calling repo's GITHUB_TOKEN —
+# no PAT. The calling repo must enable
+# Settings → Actions → General → "Allow GitHub Actions to create and approve pull requests".
+name: Sync shared rules
+on:
+  workflow_call:
+    inputs:
+      source-repo:
+        description: "owner/repo to fetch shared-rules.md from (must be public)"
+        type: string
+        default: JINGBANZ/rules
+      source-ref:
+        description: "branch or tag of the source repo"
+        type: string
+        default: main
+      target-file:
+        description: "file in the calling repo containing the shared-rules marker block"
+        type: string
+        default: AGENTS.md
+permissions: {}
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Splice shared rules into the marker block
+        env:
+          SOURCE_REPO: ${{ inputs.source-repo }}
+          SOURCE_REF: ${{ inputs.source-ref }}
+          TARGET_FILE: ${{ inputs.target-file }}
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/${SOURCE_REPO}/${SOURCE_REF}/shared-rules.md" \
+            -o "${RUNNER_TEMP}/shared-rules.md"
+          python3 - <<'EOF'
+          import os, pathlib, sys
+          target = pathlib.Path(os.environ["TARGET_FILE"])
+          rules = pathlib.Path(os.environ["RUNNER_TEMP"], "shared-rules.md").read_text().strip()
+          text = target.read_text()
+          # The begin marker must stay on a single line; everything after it up to the end marker
+          # is machine-owned and replaced wholesale.
+          BEGIN, END = "<!-- shared-rules:begin", "<!-- shared-rules:end -->"
+          i, j = text.find(BEGIN), text.find(END)
+          if i == -1 or j == -1 or j < i:
+              sys.exit(f"{target}: shared-rules marker block not found or malformed")
+          begin_line_end = text.index("\n", i)
+          target.write_text(text[: begin_line_end + 1] + "\n" + rules + "\n\n" + text[j:])
+          EOF
+      - name: Open a pull request if anything changed
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          commit-message: "chore: sync shared rules from ${{ inputs.source-repo }}"
+          title: "chore: sync shared rules"
+          body: |
+            Automated update of the shared-rules block in `${{ inputs.target-file }}`, synced from
+            [`${{ inputs.source-repo }}`](https://github.com/${{ inputs.source-repo }}).
+            Review and merge to adopt the latest shared engineering rules.
+          branch: chore/sync-shared-rules
+          delete-branch: true
