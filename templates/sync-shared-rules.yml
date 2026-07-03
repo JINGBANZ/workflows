@@ -4,6 +4,8 @@ name: Sync shared rules
 on:
   schedule:
     - cron: "0 6 * * 1" # weekly, Monday 06:00 UTC; run manually via workflow_dispatch when needed
+    # Heads-up: on public repos GitHub disables schedules after ~60 days without repo activity;
+    # re-enable in the Actions tab (or run manually) if syncs stop arriving.
   workflow_dispatch: {}
 permissions: {}
 jobs:

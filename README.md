@@ -28,6 +28,6 @@ Ready-to-copy caller workflows live in [`templates/`](./templates):
 - [`templates/sync-shared-rules.yml`](./templates/sync-shared-rules.yml) — weekly shared-rules sync
   (needs "Allow GitHub Actions to create and approve pull requests" enabled in the target repo).
 
-Drop one into the target repo's `.github/workflows/`. The caller owns the triggers (and the
-`@claude` gate) and passes the `CLAUDE_CODE_OAUTH_TOKEN` secret down; the review logic stays here, so
-updates roll out to every caller automatically.
+Drop one into the target repo's `.github/workflows/`. The caller owns the triggers; the logic stays
+here, so updates roll out to every caller automatically. The two Claude templates also own the
+`@claude` gate and pass the `CLAUDE_CODE_OAUTH_TOKEN` secret down; the sync template needs no secret.
