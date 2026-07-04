@@ -1,0 +1,78 @@
+name: Issue Opener (reusable)
+
+# Reusable workflow: a scheduled agent explores the caller's repo and files at most ONE small,
+# actionable issue. The caller owns the trigger (schedule/workflow_dispatch) and passes secrets.
+#
+# Engine-agnostic surface: callers pass `engine` (default: claude); the agent step is selected
+# here, so switching engines later is a hub-side change that never touches callers.
+#
+# BOT_PAT (a PAT with issues:write on the caller repo) is load-bearing: an issue created with the
+# default GITHUB_TOKEN would NOT trigger the issue-worker workflow (GitHub suppresses workflow
+# triggers for default-token events). The agent's `gh` calls use it via the GH_TOKEN env var.
+on:
+  workflow_call:
+    inputs:
+      engine:
+        description: Agent engine to run (currently only 'claude'; 'codex' reserved).
+        type: string
+        required: false
+        default: claude
+      model:
+        description: Model for the claude engine.
+        type: string
+        required: false
+        default: claude-opus-4-8
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: false
+      BOT_PAT:
+        required: true
+
+jobs:
+  open-issue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Validate engine
+        if: inputs.engine != 'claude'
+        run: |
+          echo "::error::engine '${{ inputs.engine }}' is not wired up yet (supported: claude)"
+          exit 1
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Run issue opener (claude)
+        if: inputs.engine == 'claude'
+        uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ secrets.BOT_PAT }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.BOT_PAT }}
+          prompt: |
+            You are the autonomous repository auditor for ${{ github.repository }}. Your job is to
+            file exactly ONE new, small, actionable GitHub issue.
+
+            Steps:
+            1. Run `gh issue list --state open --limit 100` and `gh issue list --state closed --limit 30`
+               to learn what already exists. Never file a duplicate or near-duplicate.
+            2. Explore the codebase: bugs, missing tests, documentation drift, dead code, dependency
+               problems, TODO comments, developer-experience gaps.
+            3. Pick the single most valuable finding that an autonomous coding agent could complete
+               in one sitting: small, well-scoped, verifiable.
+            4. File it with `gh issue create`. The body must include: context, the specific files
+               involved, acceptance criteria, and a suggested approach.
+
+            Rules:
+            - File exactly one issue. If nothing genuinely valuable exists, file nothing and say so.
+            - Never modify files, never push, never open PRs.
+          claude_args: |
+            --model ${{ inputs.model }}
+            --max-turns 30
+            --allowedTools "Bash(gh issue list:*),Bash(gh issue create:*),Bash(gh search:*)"
