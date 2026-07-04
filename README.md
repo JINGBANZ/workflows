@@ -9,6 +9,7 @@ private ones) can call these via `workflow_call`.
 |---|---|
 | `.github/workflows/claude-code-review.yml` | Automatic Claude PR review — posts inline diff comments. |
 | `.github/workflows/claude.yml` | On-demand `@claude` mentions in issues/PRs. |
+| `.github/workflows/sync-shared-rules.yml` | Syncs the shared-rules block in `AGENTS.md` from [JINGBANZ/rules](https://github.com/JINGBANZ/rules) — opens a PR on drift. |
 
 ## Quick start (in a target repo)
 
@@ -24,7 +25,9 @@ Ready-to-copy caller workflows live in [`templates/`](./templates):
 
 - [`templates/claude-code-review.yml`](./templates/claude-code-review.yml) — automatic PR review.
 - [`templates/claude.yml`](./templates/claude.yml) — `@claude` mentions.
+- [`templates/sync-shared-rules.yml`](./templates/sync-shared-rules.yml) — weekly shared-rules sync
+  (needs "Allow GitHub Actions to create and approve pull requests" enabled in the target repo).
 
-Drop one into the target repo's `.github/workflows/`. The caller owns the triggers (and the
-`@claude` gate) and passes the `CLAUDE_CODE_OAUTH_TOKEN` secret down; the review logic stays here, so
-updates roll out to every caller automatically.
+Drop one into the target repo's `.github/workflows/`. The caller owns the triggers; the logic stays
+here, so updates roll out to every caller automatically. The two Claude templates also own the
+`@claude` gate and pass the `CLAUDE_CODE_OAUTH_TOKEN` secret down; the sync template needs no secret.
