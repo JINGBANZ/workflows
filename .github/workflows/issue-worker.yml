@@ -102,13 +102,13 @@ jobs:
             - Stay strictly within the scope of the issue.
             - If the issue is not actionable as written, comment on it explaining why instead of
               opening a PR.
-          # Broad Bash is intentional: the worker must run arbitrary build/test commands. The gate
-          # above means only write-access authors reach this step; BOT_PAT in env is the accepted
-          # trade-off for a fully autonomous chain.
+          # Full permissions by choice: the runner is an ephemeral sandbox and the worker must run
+          # arbitrary build/test commands anyway. The gate above means only write-access authors
+          # reach this step; BOT_PAT in env is the accepted trade-off for a fully autonomous chain.
           claude_args: |
             --model ${{ inputs.model }}
             --max-turns 100
-            --allowedTools "Bash"
+            --dangerously-skip-permissions
 
       # Same failure-visibility guard as the opener: green check must mean the agent succeeded.
       - name: Fail if the agent errored

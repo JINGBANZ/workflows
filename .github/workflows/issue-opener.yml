@@ -74,18 +74,17 @@ jobs:
                body must include: context, the specific files involved, acceptance criteria, and a
                suggested approach.
 
-            IMPORTANT — your Bash access is allowlisted by prefix. Every gh command must be a
-            single, standalone command: no pipes, no `&&` or `;` chaining, no command substitution
-            `$(...)`, no heredocs. If a command is denied, simplify it to a bare `gh issue ...` or
-            `gh search ...` invocation instead of retrying variations.
-
             Rules:
             - File exactly one issue. If nothing genuinely valuable exists, file nothing and say so.
-            - Never modify files (except the issue-body file), never push, never open PRs.
+            - Never modify repo files (except the issue-body scratch file), never push, never open PRs.
+          # Full permissions by choice: the runner is an ephemeral sandbox and Bash access is
+          # already arbitrary code execution, so a curated allowlist only adds denial failure
+          # modes (e2e run 2: opus burned 23 turns on 7 denials and filed nothing). The prompt,
+          # --max-turns, and the is_error guard below are the real controls.
           claude_args: |
             --model ${{ inputs.model }}
             --max-turns 30
-            --allowedTools "Bash(gh issue list:*),Bash(gh issue view:*),Bash(gh issue create:*),Bash(gh search:*)"
+            --dangerously-skip-permissions
 
       # The action can exit green while the agent itself failed (is_error in the result JSON) —
       # e.g. it burned all turns on permission denials. Surface that as a job failure so a silent
