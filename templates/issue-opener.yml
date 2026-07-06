@@ -19,7 +19,8 @@ jobs:
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
       BOT_PAT: ${{ secrets.BOT_PAT }}
-    # Optional: pick the engine/model (defaults: claude / claude-opus-4-8)
+    # Optional: pick the engine/model, or tune backpressure (defaults shown)
     # with:
     #   engine: claude
-    #   model: claude-sonnet-4-6
+    #   model: claude-opus-4-8
+    #   max_open_issues: 3  # skip runs while this many agent-filed issues are open

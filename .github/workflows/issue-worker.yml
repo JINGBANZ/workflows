@@ -1,7 +1,7 @@
 name: Issue Worker (reusable)
 
-# Reusable workflow: when an issue is opened, an agent implements it and opens a PR. The caller
-# owns the trigger (`issues: [opened]`) and stays trivial; ALL policy lives here.
+# Reusable workflow: when an issue is opened, an agent implements it and a PR is opened. The
+# caller owns the trigger (`issues: [opened]`) and stays trivial; ALL policy lives here.
 #
 # Trust gate (engine-agnostic, defined once for every caller): the `gate` job verifies the issue
 # author has write permission on the repo before any agent step runs. This must live here — the
@@ -9,8 +9,16 @@ name: Issue Worker (reusable)
 # not, and the trust model must not depend on the vendor. Do not widen the gate to CONTRIBUTOR:
 # "ever had a commit merged" is not "has access".
 #
-# BOT_PAT is load-bearing: a PR created with the default GITHUB_TOKEN would NOT trigger the
-# pull_request review workflow (GitHub suppresses workflow triggers for default-token events).
+# Split-privilege design (the "safe outputs" pattern):
+#   - The AGENT gets full shell access (it must run arbitrary builds/tests) but NO GitHub
+#     credential in its shell env — it implements the issue, commits locally, and writes a PR
+#     draft file. Issue content reaches it via track_progress context injection (sanitized by
+#     the action), not raw interpolation.
+#   - Deterministic steps then verify real commits exist, push the branch, and open the PR with
+#     BOT_PAT. The PAT matters: default-GITHUB_TOKEN events never trigger workflows, so the PR
+#     would not start the review workflow without it.
+#   - On any failure, a final step comments on the issue with the run link — nothing is silent.
+
 on:
   workflow_call:
     inputs:
@@ -58,9 +66,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
-      contents: write
-      pull-requests: write
-      issues: write
+      contents: read
     steps:
       - name: Validate engine
         if: inputs.engine != 'claude'
@@ -72,50 +78,118 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
+          persist-credentials: false
+
+      - name: Record pre-agent baseline
+        id: base
+        run: |
+          mkdir -p "$RUNNER_TEMP/agent"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Run issue worker (claude)
         id: agent
         if: inputs.engine == 'claude'
         uses: anthropics/claude-code-action@v1
         env:
-          GH_TOKEN: ${{ secrets.BOT_PAT }}
+          CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: '1'
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.BOT_PAT }}
           track_progress: true
           prompt: |
-            You are the autonomous issue worker for ${{ github.repository }}. Resolve issue
-            #${{ github.event.issue.number }} end to end.
+            You are the autonomous issue worker for ${{ github.repository }}, resolving issue
+            #${{ github.event.issue.number }} (its title and body are in the context above).
+            You have NO GitHub credentials in your shell: `gh` will not work and you must not
+            push — later pipeline steps publish your work.
 
             Steps:
-            1. Read the issue: `gh issue view ${{ github.event.issue.number }}` (title, body, comments).
-            2. Implement the requested change, with tests where appropriate.
+            1. Understand the issue from the context above.
+            2. Implement the requested change, with tests where appropriate. You have full shell
+               access for builds and test runs.
             3. Run the repo's test suite if one exists and make it pass.
-            4. Commit your changes (you are already on a dedicated branch) and push:
-               `git push -u origin HEAD` if not already pushed.
-            5. Open a pull request:
-               `gh pr create --title "<concise title>" --body "<summary>
+            4. Commit all your changes locally with git (you are already on a dedicated branch).
+            5. Write ${{ runner.temp }}/agent/pr.md in exactly this format:
+               - line 1: `TITLE: <concise PR title>`
+               - remaining lines: the PR description — what changed, why, and how it was tested.
 
-               Fixes #${{ github.event.issue.number }}"`
+            If the issue is not actionable as written, make no code changes and write
+            ${{ runner.temp }}/agent/pr.md with `NO_CHANGES` as line 1, followed by a short
+            explanation — it will be posted on the issue as a comment.
 
-            Rules:
-            - Stay strictly within the scope of the issue.
-            - If the issue is not actionable as written, comment on it explaining why instead of
-              opening a PR.
-          # Full permissions by choice: the runner is an ephemeral sandbox and the worker must run
-          # arbitrary build/test commands anyway. The gate above means only write-access authors
-          # reach this step; BOT_PAT in env is the accepted trade-off for a fully autonomous chain.
+            Stay strictly within the scope of the issue.
           claude_args: |
             --model ${{ inputs.model }}
             --max-turns 100
-            --dangerously-skip-permissions
+            --allowedTools "Bash"
 
-      # Same failure-visibility guard as the opener: green check must mean the agent succeeded.
-      - name: Fail if the agent errored
-        if: inputs.engine == 'claude' && steps.agent.outputs.execution_file != ''
+      # Deterministic publisher: verifies the agent's work product, pushes, opens the PR. The
+      # only steps holding a write credential. Fails loudly on agent error, missing draft, or a
+      # draft that claims work without commits.
+      - name: Verify work and open PR
+        if: inputs.engine == 'claude'
+        env:
+          GH_TOKEN: ${{ secrets.BOT_PAT }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          BASELINE: ${{ steps.base.outputs.sha }}
         run: |
-          if jq -e '.is_error == true' "${{ steps.agent.outputs.execution_file }}" > /dev/null; then
+          exec_file="${{ steps.agent.outputs.execution_file }}"
+          if [ -n "$exec_file" ] && jq -e '.is_error == true' "$exec_file" > /dev/null; then
             echo "::error::Agent finished with is_error=true (see execution log above)"
-            jq '{num_turns, permission_denials_count, total_cost_usd}' "${{ steps.agent.outputs.execution_file }}" || true
+            jq '{num_turns, permission_denials_count, total_cost_usd}' "$exec_file" || true
             exit 1
           fi
+
+          draft="$RUNNER_TEMP/agent/pr.md"
+          if [ ! -s "$draft" ]; then
+            echo "::error::Agent produced no PR draft"
+            exit 1
+          fi
+          first=$(head -n 1 "$draft")
+
+          if [ "$first" = "NO_CHANGES" ]; then
+            comment="$RUNNER_TEMP/agent/comment.md"
+            {
+              echo "The issue worker reviewed this issue and did not open a PR:"
+              echo
+              tail -n +2 "$draft"
+            } > "$comment"
+            gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$comment"
+            echo "::notice::Not actionable — explanation posted on issue #${ISSUE_NUMBER}."
+            exit 0
+          fi
+
+          case "$first" in
+            "TITLE: "*) title=${first#TITLE: } ;;
+            *) echo "::error::Draft malformed: first line must be 'TITLE: ...' or 'NO_CHANGES'"; exit 1 ;;
+          esac
+
+          # Safety net: commit anything the agent left uncommitted.
+          if [ -n "$(git status --porcelain)" ]; then
+            git config user.name "github-actions"
+            git config user.email "github-actions@users.noreply.github.com"
+            git add -A
+            git commit -m "chore: commit remaining agent changes"
+          fi
+
+          if [ "$(git rev-parse HEAD)" = "$BASELINE" ]; then
+            echo "::error::Agent drafted a PR but made no commits"
+            exit 1
+          fi
+
+          branch=$(git branch --show-current)
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/${branch}"
+
+          body="$RUNNER_TEMP/agent/pr-body.md"
+          tail -n +2 "$draft" > "$body"
+          printf '\n\nFixes #%s\n' "$ISSUE_NUMBER" >> "$body"
+          url=$(gh pr create --repo "$GITHUB_REPOSITORY" --head "$branch" --title "$title" --body-file "$body")
+          echo "::notice::Opened ${url}"
+
+      # Nothing is allowed to fail silently: any failure above lands back on the issue.
+      - name: Report failure on the issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.BOT_PAT }}
+        run: |
+          gh issue comment "${{ github.event.issue.number }}" --repo "$GITHUB_REPOSITORY" \
+            --body "⚠️ The issue worker failed on this issue. See the run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
