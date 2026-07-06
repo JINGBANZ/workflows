@@ -1,0 +1,110 @@
+name: Issue Worker (reusable)
+
+# Reusable workflow: when an issue is opened, an agent implements it and opens a PR. The caller
+# owns the trigger (`issues: [opened]`) and stays trivial; ALL policy lives here.
+#
+# Trust gate (engine-agnostic, defined once for every caller): the `gate` job verifies the issue
+# author has write permission on the repo before any agent step runs. This must live here — the
+# claude engine happens to ship its own built-in write-access check, but a swapped-in engine may
+# not, and the trust model must not depend on the vendor. Do not widen the gate to CONTRIBUTOR:
+# "ever had a commit merged" is not "has access".
+#
+# BOT_PAT is load-bearing: a PR created with the default GITHUB_TOKEN would NOT trigger the
+# pull_request review workflow (GitHub suppresses workflow triggers for default-token events).
+on:
+  workflow_call:
+    inputs:
+      engine:
+        description: Agent engine to run (currently only 'claude'; 'codex' reserved).
+        type: string
+        required: false
+        default: claude
+      model:
+        description: Model for the claude engine.
+        type: string
+        required: false
+        default: claude-opus-4-8
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: false
+      BOT_PAT:
+        required: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      allowed: ${{ steps.check.outputs.allowed }}
+    steps:
+      - name: Check issue author has write access
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.BOT_PAT }}
+          AUTHOR: ${{ github.event.issue.user.login }}
+        run: |
+          perm=$(gh api "repos/${{ github.repository }}/collaborators/${AUTHOR}/permission" --jq .permission 2>/dev/null || echo "none")
+          echo "issue author: ${AUTHOR}, permission: ${perm}"
+          if [ "$perm" = "admin" ] || [ "$perm" = "maintain" ] || [ "$perm" = "write" ]; then
+            echo "allowed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "allowed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Issue author '${AUTHOR}' lacks write access — worker will not run."
+          fi
+
+  work:
+    needs: gate
+    if: needs.gate.outputs.allowed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Validate engine
+        if: inputs.engine != 'claude'
+        run: |
+          echo "::error::engine '${{ inputs.engine }}' is not wired up yet (supported: claude)"
+          exit 1
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Run issue worker (claude)
+        if: inputs.engine == 'claude'
+        uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ secrets.BOT_PAT }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.BOT_PAT }}
+          track_progress: true
+          prompt: |
+            You are the autonomous issue worker for ${{ github.repository }}. Resolve issue
+            #${{ github.event.issue.number }} end to end.
+
+            Steps:
+            1. Read the issue: `gh issue view ${{ github.event.issue.number }}` (title, body, comments).
+            2. Implement the requested change, with tests where appropriate.
+            3. Run the repo's test suite if one exists and make it pass.
+            4. Commit your changes (you are already on a dedicated branch) and push:
+               `git push -u origin HEAD` if not already pushed.
+            5. Open a pull request:
+               `gh pr create --title "<concise title>" --body "<summary>
+
+               Fixes #${{ github.event.issue.number }}"`
+
+            Rules:
+            - Stay strictly within the scope of the issue.
+            - If the issue is not actionable as written, comment on it explaining why instead of
+              opening a PR.
+          # Broad Bash is intentional: the worker must run arbitrary build/test commands. The gate
+          # above means only write-access authors reach this step; BOT_PAT in env is the accepted
+          # trade-off for a fully autonomous chain.
+          claude_args: |
+            --model ${{ inputs.model }}
+            --max-turns 100
+            --allowedTools "Bash"
