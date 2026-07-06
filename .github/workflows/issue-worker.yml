@@ -74,6 +74,7 @@ jobs:
           fetch-depth: 1
 
       - name: Run issue worker (claude)
+        id: agent
         if: inputs.engine == 'claude'
         uses: anthropics/claude-code-action@v1
         env:
@@ -108,3 +109,13 @@ jobs:
             --model ${{ inputs.model }}
             --max-turns 100
             --allowedTools "Bash"
+
+      # Same failure-visibility guard as the opener: green check must mean the agent succeeded.
+      - name: Fail if the agent errored
+        if: inputs.engine == 'claude' && steps.agent.outputs.execution_file != ''
+        run: |
+          if jq -e '.is_error == true' "${{ steps.agent.outputs.execution_file }}" > /dev/null; then
+            echo "::error::Agent finished with is_error=true (see execution log above)"
+            jq '{num_turns, permission_denials_count, total_cost_usd}' "${{ steps.agent.outputs.execution_file }}" || true
+            exit 1
+          fi

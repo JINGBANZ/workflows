@@ -48,6 +48,7 @@ jobs:
           fetch-depth: 1
 
       - name: Run issue opener (claude)
+        id: agent
         if: inputs.engine == 'claude'
         uses: anthropics/claude-code-action@v1
         env:
@@ -60,19 +61,40 @@ jobs:
             file exactly ONE new, small, actionable GitHub issue.
 
             Steps:
-            1. Run `gh issue list --state open --limit 100` and `gh issue list --state closed --limit 30`
-               to learn what already exists. Never file a duplicate or near-duplicate.
-            2. Explore the codebase: bugs, missing tests, documentation drift, dead code, dependency
-               problems, TODO comments, developer-experience gaps.
+            1. Run `gh issue list --state open --limit 100`, then separately
+               `gh issue list --state closed --limit 30`, to learn what already exists. Never file
+               a duplicate or near-duplicate.
+            2. Explore the codebase with the Read/Grep/Glob tools: bugs, missing tests,
+               documentation drift, dead code, dependency problems, TODO comments,
+               developer-experience gaps.
             3. Pick the single most valuable finding that an autonomous coding agent could complete
                in one sitting: small, well-scoped, verifiable.
-            4. File it with `gh issue create`. The body must include: context, the specific files
-               involved, acceptance criteria, and a suggested approach.
+            4. Write the issue body to a file (e.g. /tmp/issue-body.md) with the Write tool, then
+               file it with `gh issue create --title "..." --body-file /tmp/issue-body.md`. The
+               body must include: context, the specific files involved, acceptance criteria, and a
+               suggested approach.
+
+            IMPORTANT — your Bash access is allowlisted by prefix. Every gh command must be a
+            single, standalone command: no pipes, no `&&` or `;` chaining, no command substitution
+            `$(...)`, no heredocs. If a command is denied, simplify it to a bare `gh issue ...` or
+            `gh search ...` invocation instead of retrying variations.
 
             Rules:
             - File exactly one issue. If nothing genuinely valuable exists, file nothing and say so.
-            - Never modify files, never push, never open PRs.
+            - Never modify files (except the issue-body file), never push, never open PRs.
           claude_args: |
             --model ${{ inputs.model }}
             --max-turns 30
-            --allowedTools "Bash(gh issue list:*),Bash(gh issue create:*),Bash(gh search:*)"
+            --allowedTools "Bash(gh issue list:*),Bash(gh issue view:*),Bash(gh issue create:*),Bash(gh search:*)"
+
+      # The action can exit green while the agent itself failed (is_error in the result JSON) —
+      # e.g. it burned all turns on permission denials. Surface that as a job failure so a silent
+      # no-op never shows a green check.
+      - name: Fail if the agent errored
+        if: inputs.engine == 'claude' && steps.agent.outputs.execution_file != ''
+        run: |
+          if jq -e '.is_error == true' "${{ steps.agent.outputs.execution_file }}" > /dev/null; then
+            echo "::error::Agent finished with is_error=true (see execution log above)"
+            jq '{num_turns, permission_denials_count, total_cost_usd}' "${{ steps.agent.outputs.execution_file }}" || true
+            exit 1
+          fi
