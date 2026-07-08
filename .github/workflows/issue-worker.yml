@@ -4,20 +4,17 @@ name: Issue Worker (reusable)
 # caller owns the trigger (`issues: [opened]`) and stays trivial; ALL policy lives here.
 #
 # Trust gate (engine-agnostic, defined once for every caller): the `gate` job verifies the issue
-# author has write permission on the repo before any agent step runs. This must live here — the
-# claude engine happens to ship its own built-in write-access check, but a swapped-in engine may
-# not, and the trust model must not depend on the vendor. Do not widen the gate to CONTRIBUTOR:
+# author has write permission on the repo before any agent step runs. This is the pipeline's
+# primary security control — the worker only ever acts on issues from trusted authors. It lives
+# here, not in the vendor action, so it survives an engine swap. Do not widen it to CONTRIBUTOR:
 # "ever had a commit merged" is not "has access".
 #
-# Split-privilege design (the "safe outputs" pattern):
-#   - The AGENT gets full shell access (it must run arbitrary builds/tests) but NO GitHub
-#     credential in its shell env — it implements the issue, commits locally, and writes a PR
-#     draft file. Issue content reaches it via track_progress context injection (sanitized by
-#     the action), not raw interpolation.
-#   - Deterministic steps then verify real commits exist, push the branch, and open the PR with
-#     BOT_PAT. The PAT matters: default-GITHUB_TOKEN events never trigger workflows, so the PR
-#     would not start the review workflow without it.
-#   - On any failure, a final step comments on the issue with the run link — nothing is silent.
+# Split-privilege design (a reliability measure): the AGENT gets full shell access (it must run
+# arbitrary builds/tests) but NO GitHub credential in its shell — so a stuck run can never leak a
+# token, and the permission-denial failures we hit when the agent composed its own `gh` commands
+# are gone. It edits files and writes a PR draft; peter-evans/create-pull-request (off-the-shelf)
+# commits, pushes, and opens the PR with BOT_PAT. The PAT matters: default-GITHUB_TOKEN events
+# never trigger workflows, so the PR would not start the review workflow without it.
 
 on:
   workflow_call:
@@ -67,6 +64,7 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
+      issues: write
     steps:
       - name: Validate engine
         if: inputs.engine != 'claude'
@@ -79,12 +77,6 @@ jobs:
         with:
           fetch-depth: 1
           persist-credentials: false
-
-      - name: Record pre-agent baseline
-        id: base
-        run: |
-          mkdir -p "$RUNNER_TEMP/agent"
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Run issue worker (claude)
         id: agent
@@ -99,20 +91,20 @@ jobs:
           prompt: |
             You are the autonomous issue worker for ${{ github.repository }}, resolving issue
             #${{ github.event.issue.number }} (its title and body are in the context above).
-            You have NO GitHub credentials in your shell: `gh` will not work and you must not
-            push — later pipeline steps publish your work.
+            You have NO GitHub write access in your shell: `gh` create/push will not work and you
+            must not push — a later pipeline step opens the PR from your changes.
 
             Steps:
             1. Understand the issue from the context above.
-            2. Implement the requested change, with tests where appropriate. You have full shell
-               access for builds and test runs.
+            2. Implement the requested change in the working tree, with tests where appropriate.
+               You have full shell access for builds and test runs. Leave your edits in the
+               working tree (committing is optional — the publish step handles it).
             3. Run the repo's test suite if one exists and make it pass.
-            4. Commit all your changes locally with git (you are already on a dedicated branch).
-            5. Write ${{ runner.temp }}/agent/pr.md in exactly this format:
+            4. Write ${{ runner.temp }}/agent/pr.md in exactly this format:
                - line 1: `TITLE: <concise PR title>`
                - remaining lines: the PR description — what changed, why, and how it was tested.
 
-            If the issue is not actionable as written, make no code changes and write
+            If the issue is not actionable as written, make NO code changes and write
             ${{ runner.temp }}/agent/pr.md with `NO_CHANGES` as line 1, followed by a short
             explanation — it will be posted on the issue as a comment.
 
@@ -122,15 +114,11 @@ jobs:
             --max-turns 100
             --allowedTools "Bash"
 
-      # Deterministic publisher: verifies the agent's work product, pushes, opens the PR. The
-      # only steps holding a write credential. Fails loudly on agent error, missing draft, or a
-      # draft that claims work without commits.
-      - name: Verify work and open PR
+      # Verify the agent succeeded and split its draft. Our output contract; the PR mechanics
+      # (commit/push/open) are delegated to the off-the-shelf action below.
+      - name: Verify draft
+        id: draft
         if: inputs.engine == 'claude'
-        env:
-          GH_TOKEN: ${{ secrets.BOT_PAT }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
-          BASELINE: ${{ steps.base.outputs.sha }}
         run: |
           exec_file="${{ steps.agent.outputs.execution_file }}"
           if [ -n "$exec_file" ] && jq -e '.is_error == true' "$exec_file" > /dev/null; then
@@ -145,16 +133,15 @@ jobs:
             exit 1
           fi
           first=$(head -n 1 "$draft")
+          mkdir -p "$RUNNER_TEMP/agent"
 
           if [ "$first" = "NO_CHANGES" ]; then
-            comment="$RUNNER_TEMP/agent/comment.md"
             {
               echo "The issue worker reviewed this issue and did not open a PR:"
               echo
               tail -n +2 "$draft"
-            } > "$comment"
-            gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$comment"
-            echo "::notice::Not actionable — explanation posted on issue #${ISSUE_NUMBER}."
+            } > "$RUNNER_TEMP/agent/comment.md"
+            echo "create=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -162,28 +149,40 @@ jobs:
             "TITLE: "*) title=${first#TITLE: } ;;
             *) echo "::error::Draft malformed: first line must be 'TITLE: ...' or 'NO_CHANGES'"; exit 1 ;;
           esac
-
-          # Safety net: commit anything the agent left uncommitted.
-          if [ -n "$(git status --porcelain)" ]; then
-            git config user.name "github-actions"
-            git config user.email "github-actions@users.noreply.github.com"
-            git add -A
-            git commit -m "chore: commit remaining agent changes"
-          fi
-
-          if [ "$(git rev-parse HEAD)" = "$BASELINE" ]; then
-            echo "::error::Agent drafted a PR but made no commits"
-            exit 1
-          fi
-
-          branch=$(git branch --show-current)
-          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/${branch}"
-
           body="$RUNNER_TEMP/agent/pr-body.md"
           tail -n +2 "$draft" > "$body"
-          printf '\n\nFixes #%s\n' "$ISSUE_NUMBER" >> "$body"
-          url=$(gh pr create --repo "$GITHUB_REPOSITORY" --head "$branch" --title "$title" --body-file "$body")
-          echo "::notice::Opened ${url}"
+          printf '\n\nFixes #%s\n' "${{ github.event.issue.number }}" >> "$body"
+          echo "create=true" >> "$GITHUB_OUTPUT"
+          echo "title=$title" >> "$GITHUB_OUTPUT"
+
+      # Off-the-shelf publisher: commits the working-tree changes, pushes a branch, opens the PR
+      # with BOT_PAT so it triggers the review workflow. Skips silently if there are no changes.
+      - name: Open PR
+        id: cpr
+        if: steps.draft.outputs.create == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.BOT_PAT }}
+          branch: issue-worker/${{ github.event.issue.number }}
+          title: ${{ steps.draft.outputs.title }}
+          body-path: ${{ runner.temp }}/agent/pr-body.md
+          commit-message: "fix: resolve #${{ github.event.issue.number }}"
+
+      # Green check must mean a real artifact: the agent claimed a fix but produced no diff.
+      - name: Fail if PR claimed but no changes
+        if: steps.draft.outputs.create == 'true' && steps.cpr.outputs.pull-request-number == ''
+        run: |
+          echo "::error::Agent drafted a PR but made no file changes"
+          exit 1
+
+      # Not actionable: relay the agent's explanation to the issue instead of opening a PR.
+      - name: Comment when not actionable
+        if: steps.draft.outputs.create == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.BOT_PAT }}
+        run: |
+          gh issue comment "${{ github.event.issue.number }}" --repo "$GITHUB_REPOSITORY" \
+            --body-file "$RUNNER_TEMP/agent/comment.md"
 
       # Nothing is allowed to fail silently: any failure above lands back on the issue.
       - name: Report failure on the issue

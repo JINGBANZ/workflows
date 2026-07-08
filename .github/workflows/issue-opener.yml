@@ -3,15 +3,11 @@ name: Issue Opener (reusable)
 # Reusable workflow: a scheduled agent explores the caller's repo and drafts at most ONE small,
 # actionable issue. The caller owns the trigger (schedule/workflow_dispatch) and passes secrets.
 #
-# Split-privilege design (the "safe outputs" pattern):
-#   - The AGENT runs with full shell access but ZERO GitHub credentials — its github_token is the
-#     read-only default job token, no secret is in its shell env, and it only writes a draft file.
-#   - A deterministic PUBLISH step verifies the draft and creates the issue with BOT_PAT. The PAT
-#     matters: default-GITHUB_TOKEN events never trigger workflows, so the new issue would not
-#     start the issue-worker without it.
-#   This makes permission denials structurally impossible for the agent while keeping every
-#   credential out of its reach, and a run can never silently no-op: the publish step fails the
-#   job when the agent errored or produced a malformed draft.
+# Split-privilege design: the AGENT runs with full shell access but ZERO GitHub write credentials
+# (its github_token is the read-only default job token). It only writes a draft file. The actual
+# issue is filed by peter-evans/create-issue-from-file using BOT_PAT — a maintained, off-the-shelf
+# publisher rather than hand-rolled `gh` plumbing. The PAT matters: default-GITHUB_TOKEN events
+# never trigger workflows, so the new issue would not start the issue-worker without it.
 #
 # Engine-agnostic surface: callers pass `engine` (default: claude); the agent step is selected
 # here, so switching engines later is a hub-side change that never touches callers.
@@ -106,8 +102,8 @@ jobs:
           prompt: |
             You are the autonomous repository auditor for ${{ github.repository }}. Find the
             single most valuable, small, actionable improvement and write it up as a GitHub issue
-            draft. You have NO GitHub credentials: do not use `gh`, do not push — a later
-            pipeline step files the issue from your draft.
+            draft. You have NO GitHub write access: do not use `gh` to create anything, do not
+            push — a later pipeline step files the issue from your draft.
 
             Steps:
             1. Read ${{ runner.temp }}/agent/existing-issues.md — every open and recently closed
@@ -132,12 +128,11 @@ jobs:
             --max-turns 30
             --allowedTools "Bash"
 
-      # Deterministic publisher: the only place in this workflow that holds a write credential.
-      # Fails the job on agent error or malformed draft — a green check means a real outcome.
-      - name: Verify draft and publish issue
+      # Verify the agent succeeded and split its draft into title + body for the publisher.
+      # This is our own output contract, not GitHub plumbing — the actual create is delegated.
+      - name: Verify draft
+        id: draft
         if: steps.cap.outputs.proceed == 'true' && inputs.engine == 'claude'
-        env:
-          GH_TOKEN: ${{ secrets.BOT_PAT }}
         run: |
           exec_file="${{ steps.agent.outputs.execution_file }}"
           if [ -n "$exec_file" ] && jq -e '.is_error == true' "$exec_file" > /dev/null; then
@@ -154,6 +149,7 @@ jobs:
           first=$(head -n 1 "$draft")
           if [ "$first" = "NO_CHANGES" ]; then
             echo "::notice::Agent found nothing worth filing — no issue created."
+            echo "create=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           case "$first" in
@@ -164,5 +160,14 @@ jobs:
           body="$RUNNER_TEMP/agent/issue-body.md"
           tail -n +2 "$draft" > "$body"
           printf '\n\n<!-- agent: issue-opener -->\n' >> "$body"
-          url=$(gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file "$body")
-          echo "::notice::Filed ${url}"
+          echo "create=true" >> "$GITHUB_OUTPUT"
+          echo "title=$title" >> "$GITHUB_OUTPUT"
+
+      # Off-the-shelf publisher: files the issue with BOT_PAT so it triggers the issue-worker.
+      - name: File issue
+        if: steps.draft.outputs.create == 'true'
+        uses: peter-evans/create-issue-from-file@v5
+        with:
+          token: ${{ secrets.BOT_PAT }}
+          title: ${{ steps.draft.outputs.title }}
+          content-filepath: ${{ runner.temp }}/agent/issue-body.md
