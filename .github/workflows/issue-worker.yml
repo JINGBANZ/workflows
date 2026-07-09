@@ -4,13 +4,19 @@ name: Issue Worker (reusable)
 # owns the trigger (`issues: [opened]`) and stays trivial; ALL policy lives here.
 #
 # Trust gate (engine-agnostic, defined once for every caller): the `gate` job verifies the issue
-# author has write permission on the repo before any agent step runs. This must live here — the
-# claude engine happens to ship its own built-in write-access check, but a swapped-in engine may
-# not, and the trust model must not depend on the vendor. Do not widen the gate to CONTRIBUTOR:
+# author has write permission on the repo before any agent step runs. This is the pipeline's
+# primary security control — the worker only ever acts on issues from trusted authors. It lives
+# here, not in the vendor action, so it survives an engine swap. Do not widen it to CONTRIBUTOR:
 # "ever had a commit merged" is not "has access".
 #
-# BOT_PAT is load-bearing: a PR created with the default GITHUB_TOKEN would NOT trigger the
-# pull_request review workflow (GitHub suppresses workflow triggers for default-token events).
+# The agent does the work directly: full shell to build/test, then it commits, pushes a branch,
+# and opens the PR with `gh` authed by BOT_PAT. The PAT matters because default-GITHUB_TOKEN
+# events never trigger other workflows — the PR must trigger the review workflow.
+#
+# Security envelope (see the design doc): BOT_PAT is scoped to THIS repo only. Combined with the
+# author gate and branch protection on the default branch, a worst-case injected run can open a
+# PR (needs your merge) or comment — bounded and recoverable, on public and private repos alike.
+
 on:
   workflow_call:
     inputs:
@@ -74,6 +80,7 @@ jobs:
           fetch-depth: 1
 
       - name: Run issue worker (claude)
+        id: agent
         if: inputs.engine == 'claude'
         uses: anthropics/claude-code-action@v1
         env:
@@ -84,27 +91,46 @@ jobs:
           track_progress: true
           prompt: |
             You are the autonomous issue worker for ${{ github.repository }}. Resolve issue
-            #${{ github.event.issue.number }} end to end.
+            #${{ github.event.issue.number }} (its title and body are in the context above) end to
+            end.
 
             Steps:
-            1. Read the issue: `gh issue view ${{ github.event.issue.number }}` (title, body, comments).
-            2. Implement the requested change, with tests where appropriate.
+            1. Understand the issue from the context above.
+            2. Implement the change, with tests where appropriate. You have full shell access for
+               builds and test runs.
             3. Run the repo's test suite if one exists and make it pass.
-            4. Commit your changes (you are already on a dedicated branch) and push:
-               `git push -u origin HEAD` if not already pushed.
-            5. Open a pull request:
+            4. Commit your changes (you are on a dedicated branch) and push:
+               `git push -u origin HEAD`.
+            5. Open a PR whose body ends with `Fixes #${{ github.event.issue.number }}`:
                `gh pr create --title "<concise title>" --body "<summary>
 
                Fixes #${{ github.event.issue.number }}"`
 
-            Rules:
-            - Stay strictly within the scope of the issue.
-            - If the issue is not actionable as written, comment on it explaining why instead of
-              opening a PR.
-          # Broad Bash is intentional: the worker must run arbitrary build/test commands. The gate
-          # above means only write-access authors reach this step; BOT_PAT in env is the accepted
-          # trade-off for a fully autonomous chain.
+            If the issue is not actionable as written, do NOT open a PR — instead explain why with
+            `gh issue comment ${{ github.event.issue.number }} --body "<explanation>"`.
+
+            Stay strictly within the scope of the issue.
           claude_args: |
             --model ${{ inputs.model }}
             --max-turns 100
             --allowedTools "Bash"
+
+      # Reliability guard (independent of the trust model): fail the job if the agent errored, so
+      # a bad run can't show a green check.
+      - name: Fail if the agent errored
+        if: inputs.engine == 'claude' && steps.agent.outputs.execution_file != ''
+        run: |
+          if jq -e '.is_error == true' "${{ steps.agent.outputs.execution_file }}" > /dev/null; then
+            echo "::error::Agent finished with is_error=true (see execution log above)"
+            jq '{num_turns, permission_denials_count, total_cost_usd}' "${{ steps.agent.outputs.execution_file }}" || true
+            exit 1
+          fi
+
+      # Nothing fails silently: any failure above lands back on the issue with the run link.
+      - name: Report failure on the issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.BOT_PAT }}
+        run: |
+          gh issue comment "${{ github.event.issue.number }}" --repo "$GITHUB_REPOSITORY" \
+            --body "⚠️ The issue worker failed on this issue. See the run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"

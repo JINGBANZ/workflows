@@ -3,12 +3,18 @@ name: Issue Opener (reusable)
 # Reusable workflow: a scheduled agent explores the caller's repo and files at most ONE small,
 # actionable issue. The caller owns the trigger (schedule/workflow_dispatch) and passes secrets.
 #
+# The agent does the work directly: it runs `gh` with BOT_PAT to dedup against existing issues
+# and file the new one. The PAT matters because default-GITHUB_TOKEN events never trigger other
+# workflows — the new issue must trigger the issue-worker.
+#
+# Security envelope (see the design doc): BOT_PAT is a fine-grained token scoped to THIS repo only
+# (issues + pull requests + contents). If it ever leaked via prompt injection the blast radius is
+# this repo — a PR still needs your merge, an issue is just text. Keep branch protection on the
+# default branch. --max-turns and the is_error guard are the reliability controls.
+#
 # Engine-agnostic surface: callers pass `engine` (default: claude); the agent step is selected
 # here, so switching engines later is a hub-side change that never touches callers.
-#
-# BOT_PAT (a PAT with issues:write on the caller repo) is load-bearing: an issue created with the
-# default GITHUB_TOKEN would NOT trigger the issue-worker workflow (GitHub suppresses workflow
-# triggers for default-token events). The agent's `gh` calls use it via the GH_TOKEN env var.
+
 on:
   workflow_call:
     inputs:
@@ -22,6 +28,11 @@ on:
         type: string
         required: false
         default: claude-opus-4-8
+      max_open_issues:
+        description: Skip the run while this many agent-filed issues are still open.
+        type: number
+        required: false
+        default: 3
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN:
         required: false
@@ -47,8 +58,26 @@ jobs:
         with:
           fetch-depth: 1
 
+      # Backpressure: skip the (expensive) agent run if the repo already has several unresolved
+      # agent-filed issues. Agent issues carry a hidden body marker. Read-only, uses the job token.
+      - name: Check open agent-issue cap
+        id: cap
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          count=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search '"agent: issue-opener" in:body' --json number --jq 'length')
+          echo "open agent issues: ${count} (cap: ${{ inputs.max_open_issues }})"
+          if [ "$count" -ge "${{ inputs.max_open_issues }}" ]; then
+            echo "::notice::Cap reached — skipping this run."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Run issue opener (claude)
-        if: inputs.engine == 'claude'
+        id: agent
+        if: steps.cap.outputs.proceed == 'true' && inputs.engine == 'claude'
         uses: anthropics/claude-code-action@v1
         env:
           GH_TOKEN: ${{ secrets.BOT_PAT }}
@@ -56,23 +85,37 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.BOT_PAT }}
           prompt: |
-            You are the autonomous repository auditor for ${{ github.repository }}. Your job is to
-            file exactly ONE new, small, actionable GitHub issue.
+            You are the autonomous repository auditor for ${{ github.repository }}. File exactly
+            ONE new, small, actionable GitHub issue.
 
             Steps:
-            1. Run `gh issue list --state open --limit 100` and `gh issue list --state closed --limit 30`
-               to learn what already exists. Never file a duplicate or near-duplicate.
-            2. Explore the codebase: bugs, missing tests, documentation drift, dead code, dependency
-               problems, TODO comments, developer-experience gaps.
-            3. Pick the single most valuable finding that an autonomous coding agent could complete
-               in one sitting: small, well-scoped, verifiable.
-            4. File it with `gh issue create`. The body must include: context, the specific files
-               involved, acceptance criteria, and a suggested approach.
+            1. Run `gh issue list --state open --limit 100` and
+               `gh issue list --state closed --limit 30` to see what already exists. Never file a
+               duplicate or near-duplicate.
+            2. Explore the codebase (Read/Grep/Glob and any shell commands — linters, tests,
+               dependency checks). Look for bugs, missing tests, documentation drift, dead code,
+               dependency problems, TODO comments, developer-experience gaps.
+            3. Pick the single most valuable finding an autonomous coding agent could complete in
+               one sitting: small, well-scoped, verifiable.
+            4. File it with `gh issue create`. The body must include context, the specific files
+               involved, acceptance criteria, and a suggested approach, and must END with this
+               marker line so future runs can find it:
+               `<!-- agent: issue-opener -->`
 
-            Rules:
-            - File exactly one issue. If nothing genuinely valuable exists, file nothing and say so.
-            - Never modify files, never push, never open PRs.
+            If nothing genuinely valuable exists, file nothing and say so. Do not force a trivial
+            finding. Never modify repository files, never push, never open PRs.
           claude_args: |
             --model ${{ inputs.model }}
             --max-turns 30
-            --allowedTools "Bash(gh issue list:*),Bash(gh issue create:*),Bash(gh search:*)"
+            --allowedTools "Bash"
+
+      # Reliability guard (independent of the trust model): the action exits 0 even when the agent
+      # errored, so a bad run could look green. Fail the job on is_error.
+      - name: Fail if the agent errored
+        if: steps.cap.outputs.proceed == 'true' && inputs.engine == 'claude' && steps.agent.outputs.execution_file != ''
+        run: |
+          if jq -e '.is_error == true' "${{ steps.agent.outputs.execution_file }}" > /dev/null; then
+            echo "::error::Agent finished with is_error=true (see execution log above)"
+            jq '{num_turns, permission_denials_count, total_cost_usd}' "${{ steps.agent.outputs.execution_file }}" || true
+            exit 1
+          fi
