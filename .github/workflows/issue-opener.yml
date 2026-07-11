@@ -60,23 +60,13 @@ jobs:
 
       # Backpressure: skip the (expensive) agent run if the repo already has several unresolved
       # agent-filed issues. Agent issues carry a hidden body marker. Read-only, uses the job token.
-      # The worker only acts on issues tagged `agent-task`; ensure the label exists so the agent
-      # can apply it when it files. Idempotent, read/write on issues via the job token.
-      - name: Ensure agent-task label exists
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh label create agent-task --repo "$GITHUB_REPOSITORY" \
-            --description "Filed by the issue-opener agent; the issue-worker acts only on these." \
-            --color 1D76DB --force
-
       - name: Check open agent-issue cap
         id: cap
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           count=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
-            --label agent-task --json number --jq 'length')
+            --search '"agent: issue-opener" in:body' --json number --jq 'length')
           echo "open agent issues: ${count} (cap: ${{ inputs.max_open_issues }})"
           if [ "$count" -ge "${{ inputs.max_open_issues }}" ]; then
             echo "::notice::Cap reached — skipping this run."
@@ -107,10 +97,9 @@ jobs:
                dependency problems, TODO comments, developer-experience gaps.
             3. Pick the single most valuable finding an autonomous coding agent could complete in
                one sitting: small, well-scoped, verifiable.
-            4. File it with `gh issue create --label agent-task` (the label already exists and is
-               REQUIRED — the issue worker only acts on issues carrying it). The body must include
-               context, the specific files involved, acceptance criteria, and a suggested approach,
-               and must END with this marker line so future runs can find it:
+            4. File it with `gh issue create`. The body must include context, the specific files
+               involved, acceptance criteria, and a suggested approach, and must END with this
+               marker line so future runs can find it:
                `<!-- agent: issue-opener -->`
 
             If nothing genuinely valuable exists, file nothing and say so. Do not force a trivial

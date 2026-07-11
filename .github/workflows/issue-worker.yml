@@ -60,11 +60,7 @@ jobs:
 
   work:
     needs: gate
-    # Allowlist, not blocklist: only work issues explicitly tagged `agent-task` (the issue-opener
-    # applies it to every issue it files; a human can add it to opt an issue in). Report-style
-    # issues from other agents — e.g. the web-dogfood auditor — simply never carry the tag, so this
-    # scales to any number of agents without per-agent skip rules.
-    if: "needs.gate.outputs.allowed == 'true' && contains(github.event.issue.labels.*.name, 'agent-task')"
+    if: needs.gate.outputs.allowed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:

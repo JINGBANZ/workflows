@@ -5,13 +5,13 @@
 # downstream workflow.)
 #
 # EDIT the `url:` below to your website. The reusable workflow drives that URL in a real browser
-# with the agent-browser `dogfood` skill, files ONE detailed report issue, and uploads the
-# screenshots/videos as a run artifact.
+# with the agent-browser `dogfood` skill, files ONE detailed report issue with viewable
+# screenshots/videos (committed to a `dogfood-evidence` branch in this repo).
 name: Web Dogfood Auditor
 
 on:
   schedule:
-    - cron: '0 4 * * 1' # weekly, Monday 12:00 Beijing (UTC+8); dogfood is heavy, so not daily
+    - cron: '0 19 * * 0' # weekly, Monday 03:00 Beijing (UTC+8) = Sunday 19:00 UTC; dogfood is heavy
   workflow_dispatch:
     inputs:
       url:
@@ -23,7 +23,7 @@ jobs:
   dogfood:
     uses: JINGBANZ/workflows/.github/workflows/web-dogfood.yml@main
     permissions:
-      contents: read
+      contents: write # publish-evidence job pushes the dogfood-evidence branch (never the default branch)
       issues: write
     with:
       # ↓↓↓ Set your website here. Manual runs can override it via the workflow_dispatch input.

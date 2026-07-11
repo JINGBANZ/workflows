@@ -11,16 +11,15 @@ private ones) can call these via `workflow_call`.
 | `.github/workflows/claude.yml` | On-demand `@claude` mentions in issues/PRs. |
 | `.github/workflows/sync-shared-rules.yml` | Syncs the shared-rules block in `AGENTS.md` from [JINGBANZ/rules](https://github.com/JINGBANZ/rules) — opens a PR on drift. |
 | `.github/workflows/issue-opener.yml` | Scheduled agent that explores the repo and files one small, actionable issue. |
-| `.github/workflows/issue-worker.yml` | When a write-access author opens an issue tagged `agent-task`, an agent implements it and opens a PR. |
+| `.github/workflows/issue-worker.yml` | When an issue is opened by a write-access author, an agent implements it and opens a PR. |
 | `.github/workflows/web-dogfood.yml` | Scheduled agent that drives your live website in a real browser (agent-browser `dogfood` skill), hunts bugs/UX issues, proposes growth improvements, and files one detailed report issue. |
 
 The opener and worker chain with the PR review into a fully autonomous pipeline:
 **opener files issue → worker opens PR → review comments** — every hand-off machine-to-machine.
 Both take an `engine` input (default `claude`) so the agent can be swapped (e.g. to Codex) inside
 this hub without touching callers. The worker's trust gate (issue author must have write access)
-also lives here, engine-independent. The worker acts **only on issues labeled `agent-task`** (the
-opener applies it; a human can add it to opt an issue in) — an allowlist, so other agents like the
-web-dogfood auditor can file report issues without ever tripping the worker.
+also lives here, engine-independent. The web-dogfood auditor files its report with the default
+`GITHUB_TOKEN`, which never triggers other workflows, so its reports never reach the worker.
 
 ## Quick start (in a target repo)
 
