@@ -54,7 +54,7 @@ jobs:
           exit 1
 
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 1
 
@@ -114,8 +114,12 @@ jobs:
       - name: Fail if the agent errored
         if: steps.cap.outputs.proceed == 'true' && inputs.engine == 'claude' && steps.agent.outputs.execution_file != ''
         run: |
-          if jq -e '.is_error == true' "${{ steps.agent.outputs.execution_file }}" > /dev/null; then
+          f="${{ steps.agent.outputs.execution_file }}"
+          # The execution file is a JSON array of events; the result object holds is_error. A plain
+          # `.is_error` indexes the array and errors, silently no-op'ing the guard — scan all
+          # objects instead.
+          if jq -e '[.. | objects | .is_error] | any(. == true)' "$f" > /dev/null; then
             echo "::error::Agent finished with is_error=true (see execution log above)"
-            jq '{num_turns, permission_denials_count, total_cost_usd}' "${{ steps.agent.outputs.execution_file }}" || true
+            jq '[.. | objects | select(has("num_turns"))] | last | {num_turns, permission_denials_count, total_cost_usd}' "$f" || true
             exit 1
           fi
