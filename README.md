@@ -11,13 +11,16 @@ private ones) can call these via `workflow_call`.
 | `.github/workflows/claude.yml` | On-demand `@claude` mentions in issues/PRs. |
 | `.github/workflows/sync-shared-rules.yml` | Syncs the shared-rules block in `AGENTS.md` from [JINGBANZ/rules](https://github.com/JINGBANZ/rules) — opens a PR on drift. |
 | `.github/workflows/issue-opener.yml` | Scheduled agent that explores the repo and files one small, actionable issue. |
-| `.github/workflows/issue-worker.yml` | When an issue is opened by a write-access author, an agent implements it and opens a PR. |
+| `.github/workflows/issue-worker.yml` | When a write-access author opens an issue tagged `agent-task`, an agent implements it and opens a PR. |
+| `.github/workflows/web-dogfood.yml` | Scheduled agent that drives your live website in a real browser (agent-browser `dogfood` skill), hunts bugs/UX issues, proposes growth improvements, and files one detailed report issue. |
 
 The opener and worker chain with the PR review into a fully autonomous pipeline:
 **opener files issue → worker opens PR → review comments** — every hand-off machine-to-machine.
 Both take an `engine` input (default `claude`) so the agent can be swapped (e.g. to Codex) inside
 this hub without touching callers. The worker's trust gate (issue author must have write access)
-also lives here, engine-independent.
+also lives here, engine-independent. The worker acts **only on issues labeled `agent-task`** (the
+opener applies it; a human can add it to opt an issue in) — an allowlist, so other agents like the
+web-dogfood auditor can file report issues without ever tripping the worker.
 
 ## Quick start (in a target repo)
 
@@ -41,8 +44,11 @@ Ready-to-copy caller workflows live in [`templates/`](./templates):
   (needs "Allow GitHub Actions to create and approve pull requests" enabled in the target repo).
 - [`templates/issue-opener.yml`](./templates/issue-opener.yml) — daily issue-opening agent.
 - [`templates/issue-worker.yml`](./templates/issue-worker.yml) — issue-to-PR agent.
+- [`templates/web-dogfood.yml`](./templates/web-dogfood.yml) — weekly browser dogfood auditor
+  (set your site's `url:` in the caller).
 
 Drop one into the target repo's `.github/workflows/`. The caller owns the triggers; the logic stays
 here, so updates roll out to every caller automatically. The Claude templates pass the
 `CLAUDE_CODE_OAUTH_TOKEN` secret down (`claude.yml` also owns the `@claude` gate; the opener and
-worker also need `BOT_PAT`); the sync template needs no secret.
+worker also need `BOT_PAT`); the web-dogfood and sync templates need only `CLAUDE_CODE_OAUTH_TOKEN`
+and no secret respectively.

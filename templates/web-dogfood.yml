@@ -1,0 +1,38 @@
+# Caller template — copy to a target repo's .github/workflows/web-dogfood.yml
+# Calls the reusable workflow in JINGBANZ/workflows. Needs ONE secret in the target repo:
+#   CLAUDE_CODE_OAUTH_TOKEN — run /install-github-app or `claude setup-token`
+# (No BOT_PAT: the report is filed with the default GITHUB_TOKEN, since it should NOT trigger any
+# downstream workflow.)
+#
+# EDIT the `url:` below to your website. The reusable workflow drives that URL in a real browser
+# with the agent-browser `dogfood` skill, files ONE detailed report issue, and uploads the
+# screenshots/videos as a run artifact.
+name: Web Dogfood Auditor
+
+on:
+  schedule:
+    - cron: '0 4 * * 1' # weekly, Monday 12:00 Beijing (UTC+8); dogfood is heavy, so not daily
+  workflow_dispatch:
+    inputs:
+      url:
+        description: Override the URL to dogfood for this manual run.
+        type: string
+        required: false
+
+jobs:
+  dogfood:
+    uses: JINGBANZ/workflows/.github/workflows/web-dogfood.yml@main
+    permissions:
+      contents: read
+      issues: write
+    with:
+      # ↓↓↓ Set your website here. Manual runs can override it via the workflow_dispatch input.
+      url: ${{ github.event.inputs.url || 'https://example.com' }}
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+    # Optional: pick the engine/model, or tune backpressure (defaults shown)
+    # with:
+    #   url: https://example.com
+    #   engine: claude
+    #   model: claude-opus-4-8
+    #   max_open_reports: 2  # skip runs while this many dogfood reports are still open

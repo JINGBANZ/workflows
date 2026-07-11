@@ -1,0 +1,193 @@
+name: Web Dogfood Auditor (reusable)
+
+# Reusable workflow: a scheduled agent opens the caller's live website in a real browser
+# (agent-browser CLI), runs the `dogfood` exploratory-testing skill to hunt for bugs and UX
+# problems, ALSO proposes UX/feature changes aimed at growth, then files ONE detailed GitHub
+# issue with the full report. Screenshots and repro videos are uploaded as a run artifact and
+# linked from the issue (GitHub issues can't hold local binaries).
+#
+# The agent does the work directly: it drives Chromium via `agent-browser`, loads the skill from
+# the CLI (`agent-browser skills get dogfood`), dedups against existing issues with `gh`, and
+# files the report. Unlike the opener/worker, this uses the default GITHUB_TOKEN, not BOT_PAT —
+# the report is terminal (a human reads it), so it deliberately must NOT trigger any downstream
+# workflow, which is exactly what GITHUB_TOKEN-created issues can't do. No extra secret to set up.
+#
+# Security envelope: this workflow only READS a website and WRITES a text issue plus an artifact —
+# it never modifies the repo, pushes, or opens PRs, and its token is the job-scoped GITHUB_TOKEN
+# (issues: write, contents: read). If a malicious page tried prompt injection, the blast radius is
+# one issue (just text) in one repo. --max-turns and the is_error guard are the reliability
+# controls. `max_open_reports` is backpressure so reports don't pile up.
+#
+# Engine-agnostic surface: callers pass `engine` (default: claude); the agent step is selected
+# here, so switching engines later is a hub-side change that never touches callers.
+
+on:
+  workflow_call:
+    inputs:
+      url:
+        description: The website URL to explore and test (e.g. https://example.com).
+        type: string
+        required: true
+      engine:
+        description: Agent engine to run (currently only 'claude'; 'codex' reserved).
+        type: string
+        required: false
+        default: claude
+      model:
+        description: Model for the claude engine.
+        type: string
+        required: false
+        default: claude-opus-4-8
+      max_open_reports:
+        description: Skip the run while this many agent-filed dogfood reports are still open.
+        type: number
+        required: false
+        default: 2
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: false
+
+jobs:
+  dogfood:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Validate engine
+        if: inputs.engine != 'claude'
+        run: |
+          echo "::error::engine '${{ inputs.engine }}' is not wired up yet (supported: claude)"
+          exit 1
+
+      - name: Validate URL
+        run: |
+          case "${{ inputs.url }}" in
+            http://*|https://*) echo "target: ${{ inputs.url }}" ;;
+            *) echo "::error::url must start with http:// or https:// (got '${{ inputs.url }}')"; exit 1 ;;
+          esac
+
+      # Repo checkout is read-only context so the agent can ground its feature proposals in the
+      # actual product/roadmap, not just the live site. It never writes here.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # Backpressure: skip the (expensive) browser run if several dogfood reports are still open.
+      # Reports carry a hidden body marker. Read-only, uses the job token.
+      - name: Check open dogfood-report cap
+        id: cap
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          count=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search '"agent: web-dogfood" in:body' --json number --jq 'length')
+          echo "open dogfood reports: ${count} (cap: ${{ inputs.max_open_reports }})"
+          if [ "$count" -ge "${{ inputs.max_open_reports }}" ]; then
+            echo "::notice::Cap reached — skipping this run."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Node
+        if: steps.cap.outputs.proceed == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Install the browser-automation CLI + a matching Chromium. The dogfood skill content is
+      # served by the CLI itself (`agent-browser skills get dogfood`), so it never goes stale.
+      - name: Install agent-browser
+        if: steps.cap.outputs.proceed == 'true'
+        run: |
+          npm i -g agent-browser
+          agent-browser install
+          mkdir -p dogfood-output/screenshots dogfood-output/videos
+          # WebM recording uses Chromium's built-in encoder, but ensure ffmpeg is present for GIF
+          # export / codec fallbacks. Preinstalled on ubuntu-latest; this is cheap insurance.
+          command -v ffmpeg >/dev/null || { sudo apt-get update && sudo apt-get install -y ffmpeg; }
+
+      - name: Run web dogfood (claude)
+        id: agent
+        if: steps.cap.outputs.proceed == 'true' && inputs.engine == 'claude'
+        uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          prompt: |
+            You are the autonomous web-quality auditor for ${{ github.repository }}. Explore the
+            live website ${{ inputs.url }} in a real browser, find bugs and UX problems, propose
+            growth-oriented improvements, and file ONE detailed GitHub issue with the full report.
+
+            Load the tooling and skill first (these serve version-matched instructions — follow
+            them exactly):
+              agent-browser skills get core --full
+              agent-browser skills get dogfood
+            Use the `agent-browser` binary directly (not `npx`). Chromium is already installed.
+            Write all evidence under ./dogfood-output/ (screenshots/ and videos/ already exist).
+
+            Do this in order:
+            1. DEDUP FIRST. Run `gh issue list --state open --limit 100` and
+               `gh issue list --state closed --limit 30`, and read any prior dogfood reports
+               (`gh issue list --state all --search '"agent: web-dogfood" in:body' --limit 10`).
+               Note every bug/issue already reported. Do NOT re-report anything already tracked.
+            2. EXPLORE & TEST. Follow the dogfood skill against ${{ inputs.url }}: navigate like a
+               real user through the main sections, exercise interactive elements and realistic
+               end-to-end flows, check empty/error/edge states, and watch the browser console.
+               Capture repro evidence into ./dogfood-output/ as the skill instructs — full repro
+               video + step screenshots for interactive bugs, a single annotated screenshot for
+               static ones. Aim for 5-10 well-documented, reproducible findings (skip duplicates
+               of already-tracked issues). Verify each issue reproduces before writing it up.
+            3. PROPOSE IMPROVEMENTS. While exploring, also think like a growth-minded product
+               designer: propose concrete new features or changes that would improve the user
+               experience and help attract and retain new users. Ground them in what you actually
+               saw (friction points, unclear onboarding, missing affordances). For each proposal
+               give: the problem/opportunity, the proposed change, and the expected user/growth
+               impact. Ground them in ${{ github.repository }}'s product where the checked-out repo
+               makes that possible.
+            4. FILE ONE ISSUE. Post a single, well-structured report with `gh issue create`.
+               Suggested title: `Web dogfood report — ${{ inputs.url }} (<date>)`. The body must
+               contain, in this order:
+                 - A short summary with severity counts.
+                 - `## Bugs & issues` — each finding with severity, the affected page/URL, numbered
+                   repro steps, and expected vs. actual. Reference its screenshot/video filenames
+                   (uploaded as the run artifact; link the run:
+                   ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).
+                 - `## UX & growth proposals` — the improvement ideas from step 3, prioritized.
+               The body MUST END with this exact marker line so future runs can find it and dedup:
+               `<!-- agent: web-dogfood -->`
+               Apply a `dogfood` label if it exists (create it if you can; otherwise omit).
+
+            Never modify repository files, never push, never open PRs. Only read the site, write
+            evidence under ./dogfood-output/, and file the one report issue.
+          claude_args: |
+            --model ${{ inputs.model }}
+            --max-turns 120
+            --allowedTools "Bash,Read,Write,Edit,Glob,Grep"
+
+      # Ship the screenshots/videos the agent captured. Issues can't embed local binaries, so the
+      # report links to this artifact by run URL.
+      - name: Upload dogfood evidence
+        if: always() && steps.cap.outputs.proceed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dogfood-output
+          path: dogfood-output/
+          if-no-files-found: ignore
+          retention-days: 30
+
+      # Reliability guard (independent of the trust model): the action exits 0 even when the agent
+      # errored, so a bad run could look green. Fail the job on is_error.
+      - name: Fail if the agent errored
+        if: steps.cap.outputs.proceed == 'true' && inputs.engine == 'claude' && steps.agent.outputs.execution_file != ''
+        run: |
+          if jq -e '.is_error == true' "${{ steps.agent.outputs.execution_file }}" > /dev/null; then
+            echo "::error::Agent finished with is_error=true (see execution log above)"
+            jq '{num_turns, permission_denials_count, total_cost_usd}' "${{ steps.agent.outputs.execution_file }}" || true
+            exit 1
+          fi
