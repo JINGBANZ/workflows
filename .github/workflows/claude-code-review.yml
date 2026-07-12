@@ -1,32 +1,262 @@
-name: Claude Code Review (reusable)
-
+# Code Review (reusable) — Codex by default, Claude optional.
+#
 # Reusable workflow. Call it from another repo's caller workflow with `uses:`; the caller owns the
-# trigger (e.g. `on: pull_request`) and passes the CLAUDE_CODE_OAUTH_TOKEN secret. This file has only
+# trigger (e.g. `on: pull_request`) and passes the secret for the chosen engine. This file has only
 # a `workflow_call` trigger, so it never runs on its own in this hub repo.
 #
 # Inside a called workflow the `github` context is the CALLER's, so `github.repository` and
 # `github.event.pull_request.number` resolve to the caller's PR, and `actions/checkout` checks out the
-# caller's code (its CLAUDE.md + diff).
+# caller's code (its CLAUDE.md/AGENTS.md + diff).
+#
+# Engines:
+#   codex (default) — installs the Codex CLI and runs `codex exec review`, Codex's dedicated
+#     non-interactive code-review harness (its built-in reviewer rubric returns structured JSON
+#     findings with file/line locations, priorities, and an overall verdict — not just a free-form
+#     chat answer). The findings are posted as inline PR review comments.
+#     Auth is the ChatGPT subscription, NOT an API key: run `codex login` on a trusted machine and
+#     store the resulting ~/.codex/auth.json as the CODEX_AUTH_JSON secret ("auth cache transfer",
+#     the documented headless fallback — https://developers.openai.com/codex/auth). Codex refreshes
+#     the access token in-run from the refresh token; if the secret's tokens eventually expire,
+#     re-run `codex login` and re-set the secret.
+#     Refs: https://developers.openai.com/codex/noninteractive
+#   claude — anthropics/claude-code-action@v1 with the code-review plugin, posting inline
+#     comments through the github_inline_comment MCP server. Needs CLAUDE_CODE_OAUTH_TOKEN.
+name: Code Review (reusable)
+
 on:
   workflow_call:
     inputs:
-      model:
-        description: Top-level driver model for the review (the code-review command still spawns Opus bug subagents internally).
+      engine:
+        description: Review agent to run — 'codex' (default) or 'claude'.
         type: string
         required: false
-        default: claude-sonnet-4-6
+        default: codex
+      model:
+        description: >-
+          Model override for the chosen engine. Empty means the engine's default (codex falls
+          back to gpt-5.6-sol, claude to claude-sonnet-4-6).
+        type: string
+        required: false
+        default: ''
+      effort:
+        description: >-
+          Reasoning effort for the codex engine (minimal|low|medium|high|xhigh; xhigh is
+          model-dependent). Empty means the Codex default. Ignored by the claude engine.
+        type: string
+        required: false
+        default: high
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN:
-        required: true
+        required: false
+      CODEX_AUTH_JSON:
+        description: Contents of ~/.codex/auth.json from a machine where `codex login` was run (ChatGPT subscription auth).
+        required: false
 
 jobs:
-  claude-review:
+  codex-review:
+    if: inputs.engine == 'codex'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     # Job-level on purpose: workflow-level concurrency is ignored in called reusable workflows.
     # Groups by caller PR so a new push cancels the still-running review of the stale commit;
     # runs (and their groups) live in the caller repo, so callers don't collide with each other.
     concurrency:
-      group: claude-code-review-${{ github.event.pull_request.number || github.ref }}
+      group: code-review-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      pull-requests: write # createReview posts the findings as inline comments
+    steps:
+      # Also the job's trust gate: GitHub does not pass secrets to pull_request runs from forks,
+      # so untrusted PRs (whose diff is attacker-controlled reviewer input) fail here before the
+      # agent ever runs — only same-repo PRs (write-access authors) get a review or spend quota.
+      - name: Require CODEX_AUTH_JSON
+        env:
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+        run: |
+          if [ -z "$CODEX_AUTH_JSON" ]; then
+            echo "::error::engine 'codex' needs the CODEX_AUTH_JSON secret (contents of ~/.codex/auth.json after 'codex login') passed from the caller workflow"
+            exit 1
+          fi
+
+      # fetch-depth: 0 so the merge base between the PR merge ref and the base branch resolves;
+      # the review instructions pin the diff to that exact commit.
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Install Codex CLI
+        run: npm install -g @openai/codex
+
+      - name: Seed Codex subscription auth
+        env:
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+        run: |
+          umask 077
+          mkdir -p "$HOME/.codex"
+          printf '%s' "$CODEX_AUTH_JSON" > "$HOME/.codex/auth.json"
+
+      # Codex's sandbox uses bubblewrap, which needs unprivileged user namespaces; Ubuntu 24.04+
+      # runner images gate them off. Same workaround openai/codex-action ships for its own runs
+      # (see codex-action issue #75).
+      - name: Enable unprivileged user namespaces for the Codex sandbox
+        run: |
+          if [ "$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || true)" = "0" ]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          if [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true)" = "1" ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+      # `codex exec review` keeps Codex's built-in reviewer rubric (strict finding bar, JSON
+      # output schema) as the system prompt; the custom instructions below only set the diff
+      # scope — same wording as the CLI's own --base target, which cannot be combined with
+      # custom instructions — plus the review angles to cover. PR title/body are deliberately
+      # NOT interpolated into the prompt (prompt-injection surface).
+      - name: Run Codex review
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          MODEL: ${{ inputs.model }}
+          EFFORT: ${{ inputs.effort }}
+        run: |
+          set -euo pipefail
+          MODEL="${MODEL:-gpt-5.6-sol}"
+          merge_base="$(git merge-base "origin/${BASE_REF}" HEAD)"
+
+          instructions="$(cat <<EOF
+          Review the code changes against the base branch '${BASE_REF}'. The merge base commit for this comparison is ${merge_base}. Run \`git diff ${merge_base}\` to inspect the changes relative to '${BASE_REF}'.
+
+          Be a strict, critical reviewer: actively look for reasons this change is NOT safe to merge, and do not give the benefit of the doubt. Verify suspicions against the actual code — read surrounding files, callers, and tests, and trace data flow end to end instead of judging diff hunks in isolation.
+
+          Cover each of these angles explicitly:
+          - Correctness: logic errors, off-by-one, inverted/incomplete conditionals, broken edge cases (empty/null/zero/unicode/concurrency), error handling, resource cleanup.
+          - Breaking changes: API contracts, backward compatibility, callers of changed code, config/schema/migration impacts.
+          - Security: injection, authn/authz gaps, secrets exposure, unsafe deserialization, path traversal, SSRF, risky dependency changes.
+          - Performance: algorithmic complexity, N+1 queries or IO in loops, unbounded memory growth, blocking calls on hot paths.
+          - Tests: missing or weakened coverage for changed behavior, assertions that cannot fail.
+          - Maintainability: dead code, duplication, misleading names or comments introduced by this change.
+
+          Report every qualifying finding — do not stop after the first few. Only report issues introduced by this change, not pre-existing ones. Provide prioritized, actionable findings.
+          EOF
+          )"
+
+          args=(--ephemeral -o "${RUNNER_TEMP}/review.json" -m "${MODEL}")
+          if [ -n "${EFFORT}" ]; then
+            args+=(-c "model_reasoning_effort=\"${EFFORT}\"")
+          fi
+          codex exec review "${args[@]}" "${instructions}"
+
+      # The reviewer's final message is JSON (findings[] with code_location + priority, plus an
+      # overall_correctness verdict). Post it as one PR review: summary body + one inline comment
+      # per finding. If GitHub rejects the inline anchors (lines outside the diff), fall back to
+      # listing the findings in the review body.
+      - name: Post review to PR
+        uses: actions/github-script@v7
+        env:
+          REVIEW_JSON_PATH: ${{ runner.temp }}/review.json
+        with:
+          script: |
+            const fs = require('fs');
+            const pr = context.payload.pull_request;
+            if (!pr) {
+              core.setFailed('This workflow must be called from a pull_request event.');
+              return;
+            }
+
+            let raw = fs.readFileSync(process.env.REVIEW_JSON_PATH, 'utf8').trim();
+            // The rubric forbids markdown fences around the JSON, but strip them defensively.
+            raw = raw.replace(/^```(?:json)?\s*/, '').replace(/\s*```$/, '');
+
+            let review;
+            try {
+              review = JSON.parse(raw);
+            } catch (e) {
+              core.warning(`Review output was not valid JSON (${e.message}); posting it verbatim.`);
+              await github.rest.pulls.createReview({
+                ...context.repo,
+                pull_number: pr.number,
+                commit_id: pr.head.sha,
+                event: 'COMMENT',
+                body: `## Codex code review\n\n${raw}`,
+              });
+              return;
+            }
+
+            const findings = (review.findings ?? []).slice()
+              .sort((a, b) => (a.priority ?? 9) - (b.priority ?? 9));
+            const ws = `${process.env.GITHUB_WORKSPACE}/`;
+            const toRel = (p) => (p.startsWith(ws) ? p.slice(ws.length) : p.replace(/^\/+/, ''));
+            const pct = (x) => (typeof x === 'number' ? ` (confidence ${Math.round(x * 100)}%)` : '');
+
+            const verdictEmoji = review.overall_correctness === 'patch is correct' ? '✅' : '❌';
+            const body = [
+              '## Codex code review',
+              `**Verdict:** ${verdictEmoji} ${review.overall_correctness}${pct(review.overall_confidence_score)}`,
+              review.overall_explanation ?? '',
+              findings.length
+                ? `${findings.length} finding(s) — see inline comments.`
+                : '_No findings._',
+            ].filter(Boolean).join('\n\n');
+
+            const comments = findings.map((f) => {
+              const loc = f.code_location ?? {};
+              const range = loc.line_range ?? {};
+              const end = range.end ?? range.start;
+              const c = {
+                path: toRel(loc.absolute_file_path ?? ''),
+                line: end,
+                side: 'RIGHT',
+                body: `**${f.title}**\n\n${f.body}${pct(f.confidence_score) ? `\n\n_${pct(f.confidence_score).trim()}_` : ''}`,
+              };
+              if (range.start && end && range.start < end) {
+                c.start_line = range.start;
+                c.start_side = 'RIGHT';
+              }
+              return c;
+            });
+
+            try {
+              await github.rest.pulls.createReview({
+                ...context.repo,
+                pull_number: pr.number,
+                commit_id: pr.head.sha,
+                event: 'COMMENT',
+                body,
+                comments,
+              });
+            } catch (e) {
+              core.warning(`Inline review failed (${e.message}); posting findings in the review body instead.`);
+              const flatHeader = body.replace(' — see inline comments.', ' — listed below.');
+              const flat = findings.map((f) => {
+                const loc = f.code_location ?? {};
+                const range = loc.line_range ?? {};
+                const where = loc.absolute_file_path
+                  ? ` — \`${toRel(loc.absolute_file_path)}:${range.start ?? '?'}\``
+                  : '';
+                return `- **${f.title}**${where}\n\n  ${f.body}`;
+              }).join('\n\n');
+              await github.rest.pulls.createReview({
+                ...context.repo,
+                pull_number: pr.number,
+                commit_id: pr.head.sha,
+                event: 'COMMENT',
+                body: `${flatHeader}\n\n${flat}`,
+              });
+            }
+
+  claude-review:
+    if: inputs.engine == 'claude'
+    runs-on: ubuntu-latest
+    # See codex-review for why this is job-level.
+    concurrency:
+      group: code-review-${{ github.event.pull_request.number || github.ref }}
       cancel-in-progress: true
     permissions:
       contents: read
@@ -34,6 +264,15 @@ jobs:
       issues: read
       id-token: write
     steps:
+      - name: Require CLAUDE_CODE_OAUTH_TOKEN
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+            echo "::error::engine 'claude' needs the CLAUDE_CODE_OAUTH_TOKEN secret passed from the caller workflow"
+            exit 1
+          fi
+
       - name: Checkout repository
         uses: actions/checkout@v5
         with:
@@ -51,5 +290,14 @@ jobs:
           # single top-level comment).
           prompt: '/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
           claude_args: |
-            --model ${{ inputs.model }}
+            --model ${{ inputs.model || 'claude-sonnet-4-6' }}
             --allowedTools "mcp__github_inline_comment__create_inline_comment"
+
+  unsupported-engine:
+    if: inputs.engine != 'codex' && inputs.engine != 'claude'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail on unknown engine
+        run: |
+          echo "::error::engine '${{ inputs.engine }}' is not supported (supported: codex, claude)"
+          exit 1

@@ -7,7 +7,7 @@ private ones) can call these via `workflow_call`.
 
 | Workflow | Purpose |
 |---|---|
-| `.github/workflows/claude-code-review.yml` | Automatic Claude PR review — posts inline diff comments. |
+| `.github/workflows/claude-code-review.yml` | Automatic PR review — Codex's dedicated `codex exec review` harness by default (Claude via `engine: claude`); posts inline diff comments. |
 | `.github/workflows/claude.yml` | On-demand `@claude` mentions in issues/PRs. |
 | `.github/workflows/sync-shared-rules.yml` | Syncs the shared-rules block in `AGENTS.md` from [JINGBANZ/rules](https://github.com/JINGBANZ/rules) — opens a PR on drift. |
 | `.github/workflows/issue-opener.yml` | Scheduled agent that explores the repo and files one small, actionable issue. |
@@ -16,8 +16,10 @@ private ones) can call these via `workflow_call`.
 
 The opener and worker chain with the PR review into a fully autonomous pipeline:
 **opener files issue → worker opens PR → review comments** — every hand-off machine-to-machine.
-Both take an `engine` input (default `claude`) so the agent can be swapped (e.g. to Codex) inside
-this hub without touching callers. The worker's trust gate (issue author must have write access)
+The opener and worker take an `engine` input (default `claude`) so the agent can be swapped inside
+this hub without touching callers; the review workflow's `engine` input defaults to `codex`, which
+runs Codex's purpose-built review harness (`codex exec review` — structured findings with
+priorities, file/line locations, and an overall verdict) rather than a generic prompt. The worker's trust gate (issue author must have write access)
 also lives here, engine-independent. The web-dogfood auditor files its report with the default
 `GITHUB_TOKEN`, which never triggers other workflows, so its reports never reach the worker.
 
@@ -30,14 +32,21 @@ also lives here, engine-independent. The web-dogfood auditor files its report wi
    read/write on the repo's contents, issues, and pull requests. It exists because events created
    with the default `GITHUB_TOKEN` never trigger other workflows — the PAT is what lets
    issue → worker → PR → review chain automatically.
-4. Ask Claude to read this repo and copy the caller templates from [`templates/`](./templates) into
+4. For the PR review workflow's default Codex engine, add a `CODEX_AUTH_JSON` secret — your
+   ChatGPT-subscription Codex login, no API key: run `codex login` on a trusted machine, then
+   `gh secret set CODEX_AUTH_JSON --repo <owner>/<repo> < ~/.codex/auth.json` (treat that file
+   like a password; re-seed the secret if the tokens ever expire). Repos that set
+   `engine: claude` in the review caller only need `CLAUDE_CODE_OAUTH_TOKEN`.
+5. Ask Claude to read this repo and copy the caller templates from [`templates/`](./templates) into
    the target repo's `.github/workflows/`.
 
 ## Caller templates
 
 Ready-to-copy caller workflows live in [`templates/`](./templates):
 
-- [`templates/claude-code-review.yml`](./templates/claude-code-review.yml) — automatic PR review.
+- [`templates/claude-code-review.yml`](./templates/claude-code-review.yml) — automatic PR review
+  (Codex engine by default, `gpt-5.6-sol` — needs `CODEX_AUTH_JSON` and `pull-requests: write`;
+  existing callers must update their copy when upgrading, or pin `engine: claude`).
 - [`templates/claude.yml`](./templates/claude.yml) — `@claude` mentions.
 - [`templates/sync-shared-rules.yml`](./templates/sync-shared-rules.yml) — weekly shared-rules sync
   (needs "Allow GitHub Actions to create and approve pull requests" enabled in the target repo).
