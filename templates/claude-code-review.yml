@@ -1,11 +1,7 @@
 # Caller template — copy to a target repo's .github/workflows/claude-code-review.yml
-# Calls the reusable code-review workflow in JINGBANZ/workflows. The default engine is Codex on
-# your ChatGPT subscription (no API key): run `codex login` on a trusted machine, then
-#   gh secret set CODEX_AUTH_JSON --repo <owner>/<repo> < ~/.codex/auth.json
-# To use the claude engine instead, set `engine: claude` and add the CLAUDE_CODE_OAUTH_TOKEN
-# secret (run /install-github-app there — see this repo's README quick start). Passing both
-# secrets is harmless; each engine only reads its own.
-name: Code Review
+# Calls the reusable workflow in JINGBANZ/workflows. Requires the CLAUDE_CODE_OAUTH_TOKEN secret in
+# the target repo (run /install-github-app there — see this repo's README quick start).
+name: Claude Code Review
 
 on:
   pull_request:
@@ -16,14 +12,11 @@ jobs:
     uses: JINGBANZ/workflows/.github/workflows/claude-code-review.yml@main
     permissions:
       contents: read
-      pull-requests: write # codex engine posts inline review comments with the GITHUB_TOKEN
+      pull-requests: read
       issues: read
       id-token: write
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-      CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
-    # Optional overrides:
+    # Optional: override the driver model (default: claude-sonnet-4-6)
     # with:
-    #   engine: claude          # default: codex
-    #   model: gpt-5.6-terra    # defaults: gpt-5.6-sol (codex) / claude-sonnet-4-6 (claude)
-    #   effort: xhigh           # codex reasoning effort, default: high
+    #   model: claude-opus-4-7
