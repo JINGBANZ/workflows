@@ -115,10 +115,10 @@ jobs:
         if: steps.cap.outputs.proceed == 'true' && inputs.engine == 'claude' && steps.agent.outputs.execution_file != ''
         run: |
           f="${{ steps.agent.outputs.execution_file }}"
-          # The execution file is a JSON array of events; the result object holds is_error. A plain
-          # `.is_error` indexes the array and errors, silently no-op'ing the guard — scan all
-          # objects instead.
-          if jq -e '[.. | objects | .is_error] | any(. == true)' "$f" > /dev/null; then
+          # Check ONLY the final result object's is_error (the `.type == "result"` element). A
+          # plain `.is_error` errors on the top-level array (silent no-op), and scanning every
+          # object false-positives on benign mid-run tool errors.
+          if jq -e '[.. | objects | select(.type == "result")] | last | .is_error == true' "$f" > /dev/null; then
             echo "::error::Agent finished with is_error=true (see execution log above)"
             jq '[.. | objects | select(has("num_turns"))] | last | {num_turns, permission_denials_count, total_cost_usd}' "$f" || true
             exit 1

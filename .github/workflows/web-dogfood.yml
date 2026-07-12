@@ -3,11 +3,12 @@ name: Web Dogfood Auditor (reusable)
 # Reusable workflow: a scheduled agent opens the caller's live website in a real browser
 # (agent-browser CLI), runs the `dogfood` exploratory-testing skill to hunt for bugs and UX
 # problems, ALSO proposes UX/feature changes aimed at growth, then files ONE detailed GitHub
-# issue with the full report. Screenshots/videos are viewable straight from the report: a second
-# job commits them to a `dogfood-evidence` branch IN THIS REPO, and the report links to their
-# GitHub blob URLs (which render the image / play the video in-browser for anyone who can see the
-# repo). They're kept in-repo — not a third-party image host — so private-repo evidence never
-# leaks. A full copy is also uploaded as a run artifact.
+# issue with the full report. Screenshots render INLINE in the report: a second job uploads the
+# evidence as a GitHub Release, and the agent embeds each screenshot with `![](asset-url)`. Release
+# asset URLs are github.com-origin, so GitHub serves them with the viewer's own session (not via
+# the Camo proxy, which can't see private repos) — meaning they render inline for anyone who can
+# view the repo, with no evidence branch and no third-party image host. Repro videos ride along as
+# asset links (Releases don't get an inline player). A full copy is also uploaded as a run artifact.
 #
 # The agent does the work directly: it drives Chromium via `agent-browser`, loads the skill from
 # the CLI (`agent-browser skills get dogfood`), dedups against existing issues with `gh`, and
@@ -17,10 +18,10 @@ name: Web Dogfood Auditor (reusable)
 #
 # Security envelope: the AGENT job only READS a website and WRITES a text issue (its token is
 # scoped contents: read, issues: write) — it never pushes or opens PRs, so a prompt-injecting page
-# can at worst produce one text issue. The evidence PUBLISH job needs contents: write to push the
-# branch, but runs NO agent (a deterministic script, zero injection surface) and only ever writes
-# the `dogfood-evidence` branch, never the default branch. --max-turns and the is_error guard are
-# the reliability controls. `max_open_reports` is backpressure so reports don't pile up.
+# can at worst produce one text issue. The evidence UPLOAD job needs contents: write to create the
+# Release, but runs NO agent (a deterministic script, zero injection surface). --max-turns and the
+# is_error guard are the reliability controls. `max_open_reports` is backpressure so reports don't
+# pile up.
 #
 # Engine-agnostic surface: callers pass `engine` (default: claude); the agent step is selected
 # here, so switching engines later is a hub-side change that never touches callers.
@@ -133,15 +134,19 @@ jobs:
             Use the `agent-browser` binary directly (not `npx`). Chromium is already installed.
             Write all evidence under ./dogfood-output/ (screenshots/ and videos/ already exist).
 
-            EVIDENCE LINKS: after you finish, everything you save under ./dogfood-output/ is
-            committed to this repo's `dogfood-evidence` branch, viewable at this base URL:
-              ${{ github.server_url }}/${{ github.repository }}/blob/dogfood-evidence/runs/${{ github.run_id }}
-            So a file you save to `./dogfood-output/screenshots/foo.png` is viewable at
-            `<BASE>/screenshots/foo.png` and a video at `<BASE>/videos/bar.webm`. In the report,
-            reference every screenshot/video as a Markdown LINK to its full blob URL, e.g.
-            `[📷 screenshot](<BASE>/screenshots/foo.png)` / `[🎥 repro video](<BASE>/videos/bar.webm)`.
-            Do NOT use `![](relative/path)` image embeds — relative paths do not resolve in an
-            issue and render as broken images. Use absolute blob-URL links only.
+            EVIDENCE (embed screenshots INLINE): after you finish, every file you save under
+            ./dogfood-output/ is uploaded as a GitHub Release asset, served from this base URL:
+              ${{ github.server_url }}/${{ github.repository }}/releases/download/dogfood-${{ github.run_id }}
+            Release assets are a FLAT namespace keyed by FILENAME (basename only — no folders in the
+            URL). So a file saved as `./dogfood-output/screenshots/issue-1-step-2.png` is served at
+            `<BASE>/issue-1-step-2.png`. Requirements:
+              - Give every screenshot/video a UNIQUE, lowercase kebab-case basename using only
+                [a-z0-9.-] (e.g. `issue-1-step-2.png`) so the URL is predictable and unambiguous.
+              - EMBED each screenshot INLINE in the report with image syntax:
+                `![short caption](<BASE>/issue-1-step-2.png)` — this renders the image on the issue
+                page. Do NOT use a plain link for screenshots, and never `![](relative/path)`.
+              - For repro videos, use a LINK (Releases have no inline player):
+                `[🎥 repro video](<BASE>/issue-1-repro.webm)`.
 
             Do this in order:
             1. DEDUP FIRST. Run `gh issue list --state open --limit 100` and
@@ -167,8 +172,8 @@ jobs:
                contain, in this order:
                  - A short summary with severity counts.
                  - `## Bugs & issues` — each finding with severity, the affected page/URL, numbered
-                   repro steps, and expected vs. actual, plus blob-URL LINKS (see EVIDENCE LINKS
-                   above) to its screenshots and repro video.
+                   repro steps, and expected vs. actual, with its screenshots EMBEDDED inline and
+                   its repro video LINKED (see EVIDENCE above).
                  - `## UX & growth proposals` — the improvement ideas from step 3, prioritized.
                The body MUST END with this exact marker line so future runs can find it and dedup:
                `<!-- agent: web-dogfood -->`
@@ -181,8 +186,8 @@ jobs:
             --max-turns 120
             --allowedTools "Bash,Read,Write,Edit,Glob,Grep"
 
-      # Full copy of everything the agent captured, as a downloadable bundle. The publish-evidence
-      # job also consumes this artifact to commit the files to the dogfood-evidence branch.
+      # Full copy of everything the agent captured, as a downloadable bundle. The upload-evidence
+      # job also consumes this artifact to publish the files as Release assets.
       - name: Upload dogfood evidence
         if: always() && steps.cap.outputs.proceed == 'true'
         uses: actions/upload-artifact@v6
@@ -198,20 +203,20 @@ jobs:
         if: steps.cap.outputs.proceed == 'true' && inputs.engine == 'claude' && steps.agent.outputs.execution_file != ''
         run: |
           f="${{ steps.agent.outputs.execution_file }}"
-          # The execution file is a JSON array of events; the result object holds is_error. A plain
-          # `.is_error` indexes the array and errors, silently no-op'ing the guard — scan all
-          # objects instead.
-          if jq -e '[.. | objects | .is_error] | any(. == true)' "$f" > /dev/null; then
+          # Check ONLY the final result object's is_error (the `.type == "result"` element). A
+          # plain `.is_error` errors on the top-level array (silent no-op), and scanning every
+          # object false-positives on benign mid-run tool errors.
+          if jq -e '[.. | objects | select(.type == "result")] | last | .is_error == true' "$f" > /dev/null; then
             echo "::error::Agent finished with is_error=true (see execution log above)"
             jq '[.. | objects | select(has("num_turns"))] | last | {num_turns, permission_denials_count, total_cost_usd}' "$f" || true
             exit 1
           fi
 
-  # Make the evidence viewable from the report: commit it to a `dogfood-evidence` branch (in this
-  # repo, so private evidence never leaves it) under runs/<run_id>/, matching the blob URLs the
-  # agent linked. No agent runs here — a deterministic script with zero prompt-injection surface —
-  # and it only ever writes the dogfood-evidence branch, never the default branch.
-  publish-evidence:
+  # Publish the evidence as a GitHub Release so the report's `![](...)` embeds render INLINE
+  # (release asset URLs are github.com-origin — served with the viewer's session, not via Camo — so
+  # they display on the issue page even for private repos, with no evidence branch). No agent runs
+  # here: a deterministic script with zero prompt-injection surface.
+  upload-evidence:
     needs: dogfood
     if: always() && needs.dogfood.outputs.proceed == 'true'
     runs-on: ubuntu-latest
@@ -224,35 +229,29 @@ jobs:
           name: dogfood-output
           path: dogfood-output
 
-      - name: Publish evidence to dogfood-evidence branch
+      - name: Publish evidence as a release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          branch=dogfood-evidence
-          runid="${{ github.run_id }}"
-          if [ -z "$(find dogfood-output -type f 2>/dev/null)" ]; then
-            echo "No evidence files were produced — nothing to publish."; exit 0
+          tag="dogfood-${{ github.run_id }}"
+          # Release assets are a flat namespace; collect every evidence file by basename. The agent
+          # is told to use unique kebab-case basenames, so the served URLs match what it embedded.
+          mkdir -p _assets
+          find dogfood-output -type f \( -iname '*.png' -o -iname '*.webm' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.gif' \) \
+            -exec cp {} _assets/ \;
+          if [ -z "$(ls -A _assets 2>/dev/null)" ]; then
+            echo "No evidence assets were produced — nothing to publish."; exit 0
           fi
-          work=_evidence
-          rm -rf "$work"; mkdir "$work"; cd "$work"
-          git init -q
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          # Start from the existing branch if present, else an orphan (keeps evidence off the default branch).
-          if git fetch -q --depth=1 origin "$branch" 2>/dev/null; then
-            git checkout -q -B "$branch" FETCH_HEAD
-          else
-            git checkout -q --orphan "$branch"
-          fi
-          mkdir -p "runs/$runid"
-          cp -R ../dogfood-output/. "runs/$runid/"
-          # Bound branch growth: keep only the 12 most recent run folders (run IDs are monotonic).
-          if [ -d runs ]; then
-            ls -1 runs | sort -n | head -n -12 | while read -r old; do rm -rf "runs/$old"; done
-          fi
-          git add -A
-          git commit -q -m "dogfood evidence for run ${runid}" || { echo "Nothing to commit."; exit 0; }
-          git push -q origin "$branch"
-          echo "Published evidence to ${branch}/runs/${runid}"
+          # Create the prerelease (or, on a re-run, add/replace assets on the existing one).
+          gh release create "$tag" _assets/* --repo "$GITHUB_REPOSITORY" --prerelease \
+            --title "Dogfood evidence — run ${{ github.run_id }}" \
+            --notes "Screenshots/videos for the web-dogfood report from run ${{ github.run_id }}. Auto-generated; safe to delete once the report is resolved." \
+            || gh release upload "$tag" _assets/* --repo "$GITHUB_REPOSITORY" --clobber
+          echo "Published $(ls -1 _assets | wc -l) assets to release ${tag}"
+          # Bound clutter: keep only the 12 most recent dogfood-* prereleases (tag = dogfood-<run_id>,
+          # and run IDs are monotonic, so a numeric sort on the second field is chronological).
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName \
+            --jq '.[] | .tagName | select(startswith("dogfood-"))' \
+            | sort -t- -k2 -n | head -n -12 \
+            | while read -r old; do gh release delete "$old" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true; done

@@ -5,8 +5,8 @@
 # downstream workflow.)
 #
 # EDIT the `url:` below to your website. The reusable workflow drives that URL in a real browser
-# with the agent-browser `dogfood` skill, files ONE detailed report issue with viewable
-# screenshots/videos (committed to a `dogfood-evidence` branch in this repo).
+# with the agent-browser `dogfood` skill and files ONE detailed report issue with screenshots
+# embedded inline (evidence is uploaded as a GitHub Release — no branch, no third-party host).
 name: Web Dogfood Auditor
 
 on:
@@ -23,7 +23,7 @@ jobs:
   dogfood:
     uses: JINGBANZ/workflows/.github/workflows/web-dogfood.yml@main
     permissions:
-      contents: write # publish-evidence job pushes the dogfood-evidence branch (never the default branch)
+      contents: write # upload-evidence job creates a GitHub Release for the inline screenshots
       issues: write
     with:
       # ↓↓↓ Set your website here. Manual runs can override it via the workflow_dispatch input.
