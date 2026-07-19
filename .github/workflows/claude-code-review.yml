@@ -15,13 +15,18 @@ on:
         type: string
         required: false
         default: claude-sonnet-4-6
+      runs-on:
+        description: Runner label to execute on (e.g. a self-hosted runner's label).
+        type: string
+        required: false
+        default: ubuntu-latest
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN:
         required: true
 
 jobs:
   claude-review:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs-on }}
     # Job-level on purpose: workflow-level concurrency is ignored in called reusable workflows.
     # Groups by caller PR so a new push cancels the still-running review of the stale commit;
     # runs (and their groups) live in the caller repo, so callers don't collide with each other.
