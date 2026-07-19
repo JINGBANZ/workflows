@@ -29,3 +29,6 @@ jobs:
       actions: read
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+    # Optional: run on a self-hosted runner (default: ubuntu-latest)
+    # with:
+    #   runs-on: vps

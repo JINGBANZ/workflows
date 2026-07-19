@@ -33,6 +33,11 @@ on:
         type: number
         required: false
         default: 3
+      runs-on:
+        description: Runner label to execute on (e.g. a self-hosted runner's label).
+        type: string
+        required: false
+        default: ubuntu-latest
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN:
         required: false
@@ -41,7 +46,7 @@ on:
 
 jobs:
   open-issue:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs-on }}
     timeout-minutes: 20
     permissions:
       contents: read
