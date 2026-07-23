@@ -1,0 +1,165 @@
+name: Claude Resolve Conflicts (reusable)
+
+# A separate privileged path for a top-level `@claude /resolve-conflicts` PR comment. The caller
+# owns the trigger and exact-command gate; this workflow verifies the actor and PR before writing.
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: Runner label to execute on (e.g. a self-hosted runner's label).
+        type: string
+        required: false
+        default: ubuntu-latest
+      validation-command:
+        description: Repository gate to run before pushing the merge commit.
+        type: string
+        required: true
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+
+jobs:
+  resolve:
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      pull-requests: read
+      issues: write
+    steps:
+      - name: Authorize request and read pull request
+        id: pr
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const { data: access } = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              username: context.actor,
+            });
+            if (!['admin', 'maintain', 'write'].includes(access.permission)) {
+              throw new Error(`@${context.actor} needs write access to resolve conflicts.`);
+            }
+
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            });
+            if (pr.head.repo?.full_name !== `${context.repo.owner}/${context.repo.repo}`) {
+              throw new Error('Conflict resolution is limited to same-repository pull requests.');
+            }
+
+            core.setOutput('head_ref', pr.head.ref);
+            core.setOutput('head_sha', pr.head.sha);
+            core.setOutput('base_ref', pr.base.ref);
+            core.setOutput('base_sha', pr.base.sha);
+
+      - name: Checkout pull request head
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ steps.pr.outputs.head_sha }}
+          fetch-depth: 0
+
+      - name: Start merge
+        id: merge
+        env:
+          BASE_SHA: ${{ steps.pr.outputs.base_sha }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --no-tags origin "$BASE_SHA"
+
+          if git merge-base --is-ancestor "$BASE_SHA" HEAD; then
+            echo "has_merge=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "has_merge=true" >> "$GITHUB_OUTPUT"
+          set +e
+          git merge --no-commit --no-ff "$BASE_SHA"
+          merge_status=$?
+          set -e
+
+          unmerged_files=$(git diff --name-only --diff-filter=U)
+          if [[ $merge_status -ne 0 && -z "$unmerged_files" ]]; then
+            echo "git merge failed without producing resolvable file conflicts." >&2
+            exit "$merge_status"
+          fi
+          if [[ -n "$unmerged_files" ]]; then
+            echo "needs_claude=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_claude=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve conflicted files with Claude
+        if: steps.merge.outputs.needs_claude == 'true'
+        uses: anthropics/claude-code-base-action@585d27473ea20989a691f9f3ae0f679b9202d5b8 # main
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: |
+            --max-turns 20
+            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(git status:*),Bash(git diff:*),Bash(git add:*)"
+          prompt: |
+            The repository is already in an in-progress git merge. Resolve every unmerged file.
+
+            Preserve the intent of both the pull-request branch and the base branch. Inspect the
+            conflict markers, surrounding code, and git diff before choosing each resolution. Edit
+            only paths listed by `git diff --name-only --diff-filter=U`, then stage those paths.
+
+            Do not merge, rebase, commit, push, switch branches, edit non-conflicted files, or run
+            the repository test suite. The workflow validates, commits, and pushes after you finish.
+
+      - name: Verify conflict resolution
+        if: steps.merge.outputs.has_merge == 'true'
+        run: |
+          set -euo pipefail
+          git add -u
+          if [[ -n "$(git diff --name-only --diff-filter=U)" ]]; then
+            echo "Unmerged paths remain after Claude finished." >&2
+            git diff --name-only --diff-filter=U >&2
+            exit 1
+          fi
+          git diff --cached --check
+          test -f .git/MERGE_HEAD
+
+      - name: Run repository validation
+        if: steps.merge.outputs.has_merge == 'true'
+        run: ${{ inputs.validation-command }}
+
+      - name: Commit and push
+        if: steps.merge.outputs.has_merge == 'true'
+        env:
+          BASE_REF: ${{ steps.pr.outputs.base_ref }}
+          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+        run: |
+          set -euo pipefail
+          git commit -m "chore: merge ${BASE_REF} into ${HEAD_REF}"
+          git push origin "HEAD:refs/heads/${HEAD_REF}"
+
+      - name: Report result
+        if: always()
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          ALREADY_CURRENT: ${{ steps.merge.outputs.has_merge == 'false' }}
+          BASE_REF: ${{ steps.pr.outputs.base_ref }}
+          WORKFLOW_STATUS: ${{ job.status }}
+        with:
+          script: |
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}` +
+              `/actions/runs/${context.runId}`;
+            let body;
+            if (process.env.WORKFLOW_STATUS !== 'success') {
+              body = `Conflict resolution did not complete. See the [workflow run](${runUrl}).`;
+            } else if (process.env.ALREADY_CURRENT === 'true') {
+              body = `The pull request already includes \`${process.env.BASE_REF}\`; no merge was needed.`;
+            } else {
+              body = `Resolved conflicts against \`${process.env.BASE_REF}\`, passed the repository gate, and pushed the merge commit.`;
+            }
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
