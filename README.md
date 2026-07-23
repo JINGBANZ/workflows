@@ -9,6 +9,7 @@ private ones) can call these via `workflow_call`.
 |---|---|
 | `.github/workflows/claude-code-review.yml` | Automatic Claude PR review — posts inline diff comments. |
 | `.github/workflows/claude.yml` | On-demand `@claude` mentions in issues/PRs. |
+| `.github/workflows/claude-resolve-conflicts.yml` | Guarded conflict resolution for same-repo PRs. |
 | `.github/workflows/sync-shared-rules.yml` | Syncs the shared-rules block in `AGENTS.md` from [JINGBANZ/rules](https://github.com/JINGBANZ/rules) — opens a PR on drift. |
 | `.github/workflows/issue-opener.yml` | Scheduled agent that explores the repo and files one small, actionable issue. |
 | `.github/workflows/issue-worker.yml` | When an issue is opened by a write-access author, an agent implements it and opens a PR. |
@@ -51,3 +52,14 @@ here, so updates roll out to every caller automatically. The Claude templates pa
 `CLAUDE_CODE_OAUTH_TOKEN` secret down (`claude.yml` also owns the `@claude` gate; the opener and
 worker also need `BOT_PAT`); the web-dogfood and sync templates need only `CLAUDE_CODE_OAUTH_TOKEN`
 and no secret respectively.
+
+### Resolve pull request conflicts
+
+The standard Claude action intentionally does not perform branch operations. The `claude.yml`
+template therefore routes an exact top-level PR comment, `@claude /resolve-conflicts`, to a separate
+privileged workflow. It requires the commenter to have write access, rejects fork PRs, starts the
+merge itself, asks Claude to edit the conflicted files, runs the caller's validation command, and
+only then commits and pushes.
+
+The caller grants `contents: write` and `issues: write` only to the conflict-resolution job. Set
+`validation-command` to the target repository's complete pre-push gate.
