@@ -58,10 +58,14 @@ jobs:
           echo "::error::engine '${{ inputs.engine }}' is not wired up yet (supported: claude)"
           exit 1
 
+      # The opener only reads the tree and must never push, so don't persist the job token into
+      # .git/config where the shell-capable agent could read it. All `gh` calls authenticate via
+      # the GH_TOKEN env (BOT_PAT) instead.
       - name: Checkout repository
         uses: actions/checkout@v5
         with:
           fetch-depth: 1
+          persist-credentials: false
 
       # Backpressure: skip the (expensive) agent run if the repo already has several unresolved
       # agent-filed issues. Agent issues carry a hidden body marker. Read-only, uses the job token.

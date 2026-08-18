@@ -79,10 +79,17 @@ jobs:
           echo "::error::engine '${{ inputs.engine }}' is not wired up yet (supported: claude)"
           exit 1
 
+      # Checkout persists its credential into .git/config, and the agent below has full shell —
+      # whatever lands there is agent-readable. Persist BOT_PAT (which the agent already holds by
+      # design) so the job's GITHUB_TOKEN never enters its reach; the job token can approve PRs,
+      # which would let an injected run satisfy a review requirement on its own PR. This also makes
+      # the agent's `git push` authenticate as the PAT owner, so pushes to the PR branch emit
+      # synchronize events that re-trigger the review workflow (GITHUB_TOKEN pushes would not).
       - name: Checkout repository
         uses: actions/checkout@v5
         with:
           fetch-depth: 1
+          token: ${{ secrets.BOT_PAT }}
 
       - name: Run issue worker (claude)
         id: agent
