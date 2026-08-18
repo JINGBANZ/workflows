@@ -4,16 +4,20 @@ name: Issue Worker (reusable)
 # owns the trigger (`issues: [opened]`) and stays trivial; ALL policy lives here.
 #
 # Trust gate (engine-agnostic, defined once for every caller): the `gate` job verifies the issue
-# author has write permission on the repo before any agent step runs. This is the pipeline's
-# primary security control — the worker only ever acts on issues from trusted authors. It lives
-# here, not in the vendor action, so it survives an engine swap. Do not widen it to CONTRIBUTOR:
+# author has write permission on the repo — or is this pipeline's own GitHub App, which files
+# issues via the issue-opener — before any agent step runs. This is the pipeline's primary
+# security control — the worker only ever acts on issues from trusted authors. It lives here,
+# not in the vendor action, so it survives an engine swap. Do not widen it to CONTRIBUTOR:
 # "ever had a commit merged" is not "has access".
 #
 # The agent does the work directly: full shell to build/test, then it commits, pushes a branch,
-# and opens the PR with `gh` authed by BOT_PAT. The PAT matters because default-GITHUB_TOKEN
-# events never trigger other workflows — the PR must trigger the review workflow.
+# and opens the PR with `gh` authed by a GitHub App installation token. An app token (not the
+# job's GITHUB_TOKEN) matters because default-GITHUB_TOKEN events never trigger other workflows —
+# the PR must trigger the review workflow.
 #
-# Security envelope (see the design doc): BOT_PAT is scoped to THIS repo only. Combined with the
+# Security envelope (see the design doc): the agent's token is minted per run, scoped to the
+# calling repository only, down-scoped to the worker's permissions, and revoked when the job
+# ends (≤1h either way); the app's private key never reaches the agent step. Combined with the
 # author gate and branch protection on the default branch, a worst-case injected run can open a
 # PR (needs your merge) or comment — bounded and recoverable, on public and private repos alike.
 
@@ -38,7 +42,9 @@ on:
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN:
         required: false
-      BOT_PAT:
+      APP_CLIENT_ID:
+        required: true
+      APP_PRIVATE_KEY:
         required: true
 
 jobs:
@@ -48,12 +54,30 @@ jobs:
     outputs:
       allowed: ${{ steps.check.outputs.allowed }}
     steps:
-      - name: Check issue author has write access
+      # Minted read-only, for two things: the app-slug output tells the gate which bot login is
+      # the pipeline's own app, and the token authorizes the collaborator-permission lookup
+      # (metadata read covers listing collaborators).
+      - name: Mint gate token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          permission-metadata: read
+      - name: Check issue author is trusted
         id: check
         env:
-          GH_TOKEN: ${{ secrets.BOT_PAT }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           AUTHOR: ${{ github.event.issue.user.login }}
+          APP_BOT: ${{ steps.app-token.outputs.app-slug }}[bot]
         run: |
+          # Issues filed by the pipeline's own app are trusted by construction: only this hub's
+          # workflows can act as the app, and the opener is the one that files issues.
+          if [ "$AUTHOR" = "$APP_BOT" ]; then
+            echo "issue author: ${AUTHOR} (pipeline app)"
+            echo "allowed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           perm=$(gh api "repos/${{ github.repository }}/collaborators/${AUTHOR}/permission" --jq .permission 2>/dev/null || echo "none")
           echo "issue author: ${AUTHOR}, permission: ${perm}"
           if [ "$perm" = "admin" ] || [ "$perm" = "maintain" ] || [ "$perm" = "write" ]; then
@@ -79,27 +103,41 @@ jobs:
           echo "::error::engine '${{ inputs.engine }}' is not wired up yet (supported: claude)"
           exit 1
 
+      # The agent's credential: a short-lived installation token scoped to this repository and
+      # down-scoped to exactly the worker's needs. It is revoked when the job completes, and the
+      # app's private key only ever touches this official minting step, never the agent.
+      - name: Mint agent token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          permission-metadata: read
+
       # Checkout persists its credential into .git/config, and the agent below has full shell —
-      # whatever lands there is agent-readable. Persist BOT_PAT (which the agent already holds by
-      # design) so the job's GITHUB_TOKEN never enters its reach; the job token can approve PRs,
-      # which would let an injected run satisfy a review requirement on its own PR. This also makes
-      # the agent's `git push` authenticate as the PAT owner, so pushes to the PR branch emit
-      # synchronize events that re-trigger the review workflow (GITHUB_TOKEN pushes would not).
+      # whatever lands there is agent-readable. Persist the app token (which the agent already
+      # holds by design) so the job's GITHUB_TOKEN never enters its reach; the job token can
+      # approve PRs, which would let an injected run satisfy a review requirement on its own PR.
+      # This also makes the agent's `git push` authenticate as the app, so pushes to the PR branch
+      # emit synchronize events that re-trigger the review workflow (GITHUB_TOKEN pushes would not).
       - name: Checkout repository
         uses: actions/checkout@v5
         with:
           fetch-depth: 1
-          token: ${{ secrets.BOT_PAT }}
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Run issue worker (claude)
         id: agent
         if: inputs.engine == 'claude'
         uses: anthropics/claude-code-action@v1
         env:
-          GH_TOKEN: ${{ secrets.BOT_PAT }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          github_token: ${{ secrets.BOT_PAT }}
+          github_token: ${{ steps.app-token.outputs.token }}
           track_progress: true
           prompt: |
             You are the autonomous issue worker for ${{ github.repository }}. Resolve issue
@@ -143,10 +181,12 @@ jobs:
           fi
 
       # Nothing fails silently: any failure above lands back on the issue with the run link.
+      # Deliberately the job token, not the app token: it must still work when the mint step
+      # itself is what failed, and a failure comment has no downstream workflow to trigger.
       - name: Report failure on the issue
         if: failure()
         env:
-          GH_TOKEN: ${{ secrets.BOT_PAT }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           gh issue comment "${{ github.event.issue.number }}" --repo "$GITHUB_REPOSITORY" \
             --body "⚠️ The issue worker failed on this issue. See the run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
