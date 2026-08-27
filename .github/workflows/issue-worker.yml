@@ -51,6 +51,8 @@ jobs:
   gate:
     runs-on: ${{ inputs.runs-on }}
     timeout-minutes: 5
+    # The gate acts only through its minted read-only app token; its own GITHUB_TOKEN is unused.
+    permissions: {}
     outputs:
       allowed: ${{ steps.check.outputs.allowed }}
     steps:
@@ -92,9 +94,11 @@ jobs:
     if: needs.gate.outputs.allowed == 'true'
     runs-on: ${{ inputs.runs-on }}
     timeout-minutes: 45
+    # Deliberately minimal: the agent acts through the minted app token, so the job's own
+    # GITHUB_TOKEN keeps only what the failure-report step needs. All steps share one VM, so a
+    # credential recovered from the runner by an injected agent (e.g. a memory dump) must be
+    # assumed reachable — this token can then neither push nor approve the agent's PR.
     permissions:
-      contents: write
-      pull-requests: write
       issues: write
     steps:
       - name: Validate engine
