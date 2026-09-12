@@ -3,14 +3,17 @@ name: Issue Opener (reusable)
 # Reusable workflow: a scheduled agent explores the caller's repo and files at most ONE small,
 # actionable issue. The caller owns the trigger (schedule/workflow_dispatch) and passes secrets.
 #
-# The agent does the work directly: it runs `gh` with BOT_PAT to dedup against existing issues
-# and file the new one. The PAT matters because default-GITHUB_TOKEN events never trigger other
-# workflows — the new issue must trigger the issue-worker.
+# The agent does the work directly: it runs `gh` with a GitHub App installation token to dedup
+# against existing issues and file the new one. An app token (not the job's GITHUB_TOKEN) matters
+# because default-GITHUB_TOKEN events never trigger other workflows — the new issue must trigger
+# the issue-worker.
 #
-# Security envelope (see the design doc): BOT_PAT is a fine-grained token scoped to THIS repo only
-# (issues + pull requests + contents). If it ever leaked via prompt injection the blast radius is
-# this repo — a PR still needs your merge, an issue is just text. Keep branch protection on the
-# default branch. --max-turns and the is_error guard are the reliability controls.
+# Security envelope (see the design doc): the token is minted per run, scoped to the calling repo
+# only, down-scoped to issues:write + contents:read (the opener cannot push even if injected),
+# and revoked when the job ends (≤1h either way); the private key never reaches the agent step.
+# If the token ever leaked via prompt injection the blast radius is one repo's issues for minutes.
+# Keep branch protection on the default branch. --max-turns and the is_error guard are the
+# reliability controls.
 #
 # Engine-agnostic surface: callers pass `engine` (default: claude); the agent step is selected
 # here, so switching engines later is a hub-side change that never touches callers.
@@ -41,16 +44,20 @@ on:
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN:
         required: false
-      BOT_PAT:
+      APP_CLIENT_ID:
+        required: true
+      APP_PRIVATE_KEY:
         required: true
 
 jobs:
   open-issue:
     runs-on: ${{ inputs.runs-on }}
     timeout-minutes: 20
+    # Deliberately minimal: checkout fetches with this token and the cap check lists issues; the
+    # agent files the issue through its minted app token, so nothing here needs write.
     permissions:
       contents: read
-      issues: write
+      issues: read
     steps:
       - name: Validate engine
         if: inputs.engine != 'claude'
@@ -60,7 +67,7 @@ jobs:
 
       # The opener only reads the tree and must never push, so don't persist the job token into
       # .git/config where the shell-capable agent could read it. All `gh` calls authenticate via
-      # the GH_TOKEN env (BOT_PAT) instead.
+      # the GH_TOKEN env (the minted app token) instead.
       - name: Checkout repository
         uses: actions/checkout@v5
         with:
@@ -84,15 +91,29 @@ jobs:
             echo "proceed=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # The agent's credential: a short-lived installation token scoped to this repository and
+      # down-scoped so the opener cannot push or touch PRs even if injected. It is revoked when
+      # the job completes, and the private key only ever touches this official minting step.
+      - name: Mint agent token
+        id: app-token
+        if: steps.cap.outputs.proceed == 'true' && inputs.engine == 'claude'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          permission-contents: read
+          permission-issues: write
+          permission-metadata: read
+
       - name: Run issue opener (claude)
         id: agent
         if: steps.cap.outputs.proceed == 'true' && inputs.engine == 'claude'
         uses: anthropics/claude-code-action@v1
         env:
-          GH_TOKEN: ${{ secrets.BOT_PAT }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          github_token: ${{ secrets.BOT_PAT }}
+          github_token: ${{ steps.app-token.outputs.token }}
           prompt: |
             You are the autonomous repository auditor for ${{ github.repository }}. File exactly
             ONE new, small, actionable GitHub issue.

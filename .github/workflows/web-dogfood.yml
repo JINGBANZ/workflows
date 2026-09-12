@@ -12,7 +12,7 @@ name: Web Dogfood Auditor (reusable)
 #
 # The agent does the work directly: it drives Chromium via `agent-browser`, loads the skill from
 # the CLI (`agent-browser skills get dogfood`), dedups against existing issues with `gh`, and
-# files the report. Unlike the opener/worker, this uses the default GITHUB_TOKEN, not BOT_PAT —
+# files the report. Unlike the opener/worker, this uses the default GITHUB_TOKEN, not an app token —
 # the report is terminal (a human reads it), so it deliberately must NOT trigger any downstream
 # workflow, which is exactly what GITHUB_TOKEN-created issues can't do. No extra secret to set up.
 #
