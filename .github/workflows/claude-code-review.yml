@@ -20,6 +20,14 @@ on:
         type: string
         required: false
         default: ubuntu-latest
+      # claude-code-action hard-fails on bot-initiated workflows unless the bot is allow-listed.
+      # Callers whose issue-worker opens PRs as a GitHub App pass that app's slug here so those
+      # PRs still get reviewed; the empty default keeps every other bot rejected.
+      allowed-bots:
+        description: Comma-separated bot logins (without the [bot] suffix) allowed to trigger the review.
+        type: string
+        required: false
+        default: ''
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN:
         required: true
@@ -49,6 +57,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed_bots: ${{ inputs.allowed-bots }}
           plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
           plugins: 'code-review@claude-code-plugins'
           # --comment posts the review to the PR; the inline-comment tool in --allowedTools is what
