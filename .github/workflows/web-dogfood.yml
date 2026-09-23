@@ -113,6 +113,15 @@ jobs:
           # export / codec fallbacks. Preinstalled on ubuntu-latest; this is cheap insurance.
           command -v ffmpeg >/dev/null || { sudo apt-get update && sudo apt-get install -y ffmpeg; }
 
+      # The action pins its own Claude Code release, which can lag behind the models we select
+      # (claude-opus-5-5 needs 2.1.280+); install the latest and hand the action that binary.
+      - name: Install latest Claude Code
+        id: claude-code
+        if: steps.cap.outputs.proceed == 'true' && inputs.engine == 'claude'
+        run: |
+          curl -fsSL https://claude.ai/install.sh | bash -s latest
+          echo "path=$HOME/.local/bin/claude" >> "$GITHUB_OUTPUT"
+
       - name: Run web dogfood (claude)
         id: agent
         if: steps.cap.outputs.proceed == 'true' && inputs.engine == 'claude'
@@ -121,6 +130,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          path_to_claude_code_executable: ${{ steps.claude-code.outputs.path }}
           github_token: ${{ github.token }}
           prompt: |
             You are the autonomous web-quality auditor for ${{ github.repository }}. Explore the
