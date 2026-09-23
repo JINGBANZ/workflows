@@ -42,7 +42,7 @@ on:
         description: Model for the claude engine.
         type: string
         required: false
-        default: claude-opus-4-8
+        default: claude-opus-5-5
       max_open_reports:
         description: Skip the run while this many agent-filed dogfood reports are still open.
         type: number

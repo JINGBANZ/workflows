@@ -34,5 +34,5 @@ jobs:
     # with:
     #   url: https://example.com
     #   engine: claude
-    #   model: claude-opus-4-8
+    #   model: claude-opus-5-5
     #   max_open_reports: 2  # skip runs while this many dogfood reports are still open
