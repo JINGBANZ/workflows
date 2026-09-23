@@ -14,7 +14,7 @@ on:
         description: Top-level driver model for the review (the code-review command still spawns Opus bug subagents internally).
         type: string
         required: false
-        default: claude-sonnet-4-6
+        default: claude-opus-5-5
       runs-on:
         description: Runner label to execute on (e.g. a self-hosted runner's label).
         type: string

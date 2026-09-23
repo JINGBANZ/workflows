@@ -5,6 +5,11 @@ name: Claude Code (reusable)
 on:
   workflow_call:
     inputs:
+      model:
+        description: Model for the agent.
+        type: string
+        required: false
+        default: claude-opus-5-5
       runs-on:
         description: Runner label to execute on (e.g. a self-hosted runner's label).
         type: string
@@ -43,7 +48,8 @@ jobs:
           # comment that mentioned @claude.
           # prompt: 'Update the pull request description to include a summary of changes.'
 
-          # Optional: pass extra CLI args (model, allowed tools, etc.).
+          # Extra CLI args (allowed tools, etc.) go here too.
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options.
-          # claude_args: '--allowed-tools Bash(gh pr *)'
+          claude_args: |
+            --model ${{ inputs.model }}
