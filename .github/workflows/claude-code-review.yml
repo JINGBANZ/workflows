@@ -62,38 +62,33 @@ jobs:
           plugins: 'code-review@claude-code-plugins'
           # --comment posts the review to the PR; the inline-comment tool in --allowedTools is what
           # makes the action start the github_inline_comment MCP server (otherwise it falls back to a
-          # single top-level comment). The gh commands are the ones the code-review command reads and
-          # comments with. In CI nobody can approve a prompt, so a command missing here is denied,
-          # and the command's own `allowed-tools` frontmatter has not been enough to prevent that.
+          # single top-level comment).
           prompt: '/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
           claude_args: |
             --model ${{ inputs.model }}
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(gh pr list:*),Bash(gh issue view:*),Bash(gh issue list:*),Bash(gh search:*)"
+            --allowedTools "mcp__github_inline_comment__create_inline_comment"
 
-      # The action succeeds whenever the agent ends without an error, and a denied tool call is not
-      # one: a review that never read the PR still showed a green check. A working review can be
-      # denied a stray call, and a PR Claude already reviewed gets no new comment, so the job fails
-      # only when the run errored, or was denied tools and posted nothing. Only the final result
-      # object carries the outcome, as in issue-worker's guard.
-      - name: Fail if the review was blocked
-        # Also after a failed review, so the log still names what was denied. An empty
-        # execution_file means the action deliberately skipped, e.g. a PR editing its own caller.
-        if: ${{ !cancelled() && steps.claude-review.outputs.execution_file != '' }}
+      # The action succeeds whenever Claude ends without an error, so a review that never reached
+      # the PR still showed a green check. Fail unless Claude has commented on or reviewed the PR:
+      # a PR it reviewed earlier keeps that comment, and it skips drafts. The action hides Claude's
+      # output, so print its final message, which says why it did not post, and any denied calls.
+      - name: Fail if Claude did not review
+        if: ${{ !cancelled() && steps.claude-review.outputs.execution_file != '' && !github.event.pull_request.draft }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          EXECUTION_FILE: ${{ steps.claude-review.outputs.execution_file }}
         run: |
-          f="${{ steps.claude-review.outputs.execution_file }}"
-          jq -r '[.. | objects | select(.type == "result")] | last | .permission_denials // [] | .[] | "denied: \(.tool_name) \(.tool_input.command // "")"' "$f"
-          if jq -e '[.. | objects | select(.type == "result")] | last | .is_error == true' "$f" > /dev/null; then
-            echo "::error::The review errored"
-            exit 1
+          set -o pipefail
+          by_claude='.[] | select(.user.login == "claude[bot]") | .id'
+          posted=$( {
+            gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate --jq "$by_claude"
+            gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" --paginate --jq "$by_claude"
+          } | wc -l )
+          if [ "$posted" -gt 0 ]; then
+            exit 0
           fi
-          denied=$(jq '[.. | objects | select(.type == "result")] | last | ((.permission_denials // []) | length) + (.permission_denials_count // 0)' "$f")
-          posted=$(jq '[.. | objects | select(.type == "tool_result" and (.is_error | not)) | .tool_use_id] as $ok
-            | [.. | objects | select(.type == "tool_use")
-               | select(.name == "mcp__github_inline_comment__create_inline_comment"
-                        or (.name == "Bash" and ((.input.command // "") | startswith("gh pr comment"))))
-               | select(.id as $id | any($ok[]; . == $id))]
-            | length' "$f")
-          if [ "$denied" -gt 0 ] && [ "$posted" -eq 0 ]; then
-            echo "::error::The review was denied $denied tool calls and posted nothing, so it did not review this PR"
-            exit 1
-          fi
+          echo "::error::Claude did not review this PR. Its final message and any denied calls follow."
+          jq -r '[.. | objects | select(.type == "result")] | last | .result // "(no final message)" | .[0:3000]' "$EXECUTION_FILE"
+          jq -r '[.. | objects | select(.type == "result")] | last | .permission_denials // [] | .[] | "denied: \(.tool_name) \(.tool_input.command // "" | split("\n")[0] | .[0:200])"' "$EXECUTION_FILE"
+          exit 1
