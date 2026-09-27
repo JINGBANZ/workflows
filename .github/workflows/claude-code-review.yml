@@ -67,3 +67,28 @@ jobs:
           claude_args: |
             --model ${{ inputs.model }}
             --allowedTools "mcp__github_inline_comment__create_inline_comment"
+
+      # The action succeeds whenever Claude ends without an error, so a review that never reached
+      # the PR still showed a green check. Fail unless Claude has commented on or reviewed the PR:
+      # a PR it reviewed earlier keeps that comment, and it skips drafts. The action hides Claude's
+      # output, so print its final message, which says why it did not post, and any denied calls.
+      - name: Fail if Claude did not review
+        if: ${{ !cancelled() && steps.claude-review.outputs.execution_file != '' && !github.event.pull_request.draft }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          EXECUTION_FILE: ${{ steps.claude-review.outputs.execution_file }}
+        run: |
+          set -o pipefail
+          by_claude='.[] | select(.user.login == "claude[bot]") | .id'
+          posted=$( {
+            gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate --jq "$by_claude"
+            gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" --paginate --jq "$by_claude"
+          } | wc -l )
+          if [ "$posted" -gt 0 ]; then
+            exit 0
+          fi
+          echo "::error::Claude did not review this PR. Its final message and any denied calls follow."
+          jq -r '[.. | objects | select(.type == "result")] | last | .result // "(no final message)" | .[0:3000]' "$EXECUTION_FILE"
+          jq -r '[.. | objects | select(.type == "result")] | last | .permission_denials // [] | .[] | "denied: \(.tool_name) \(.tool_input.command // "" | split("\n")[0] | .[0:200])"' "$EXECUTION_FILE"
+          exit 1
