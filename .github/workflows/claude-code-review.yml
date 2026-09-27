@@ -76,7 +76,9 @@ jobs:
       # only when the run errored, or was denied tools and posted nothing. Only the final result
       # object carries the outcome, as in issue-worker's guard.
       - name: Fail if the review was blocked
-        if: steps.claude-review.outputs.execution_file != ''
+        # Also after a failed review, so the log still names what was denied. An empty
+        # execution_file means the action deliberately skipped, e.g. a PR editing its own caller.
+        if: ${{ !cancelled() && steps.claude-review.outputs.execution_file != '' }}
         run: |
           f="${{ steps.claude-review.outputs.execution_file }}"
           jq -r '[.. | objects | select(.type == "result")] | last | .permission_denials // [] | .[] | "denied: \(.tool_name) \(.tool_input.command // "")"' "$f"
